@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 
 	"github.com/tkircsi/cairn/internal/blobstore"
@@ -236,8 +237,19 @@ func TestChunkedPush(t *testing.T) {
 		t.Errorf("Range = %q, want 0-0", got)
 	}
 
-	if resp.Header.Get("Docker-Upload-UUID") == "" {
-		t.Error("start returned no Docker-Upload-UUID")
+	// end-4a: "The <location> MUST contain a UUID representing a unique session
+	// ID for the upload to follow."
+	sessionID := resp.Header.Get("Docker-Upload-UUID")
+
+	parsed, err := uuid.Parse(sessionID)
+	if err != nil {
+		t.Errorf("session id %q is not a UUID: %v", sessionID, err)
+	} else if parsed.Version() != 4 {
+		t.Errorf("session id is UUID version %d, want 4: a guessable session id is a capability leak", parsed.Version())
+	}
+
+	if !strings.HasSuffix(session, sessionID) {
+		t.Errorf("Location %q does not contain the session id %q", session, sessionID)
 	}
 
 	// Split at an offset that is not a round number, so an off-by-one in the
@@ -535,10 +547,10 @@ func TestMaxBlobSize(t *testing.T) {
 func TestRejectedRequests(t *testing.T) {
 	server := newServer(t)
 
-	// A well-formed but unissued session id: 32 hex characters that no upload
-	// ever used. This has to be a 404 and not a new session, or a client could
-	// choose its own upload identifiers.
-	unissued := strings.Repeat("ab", 16)
+	// A well-formed but unissued session id: a valid v4 UUID that no upload ever
+	// used. This has to be a 404 and not a new session, or a client could choose
+	// its own upload identifiers.
+	const unissued = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
 
 	cases := []struct {
 		name   string
@@ -579,6 +591,16 @@ func TestRejectedRequests(t *testing.T) {
 			name:   "session id that could not have been issued",
 			method: http.MethodPatch,
 			path:   "/v2/" + repo + "/blobs/uploads/../../etc/passwd",
+			status: http.StatusNotFound,
+			code:   "BLOB_UPLOAD_UNKNOWN",
+		},
+		{
+			// The same UUID unhyphenated. uuid.Parse accepts this spelling, so
+			// without the canonical-form check it would reach the filesystem as a
+			// name this package never issued.
+			name:   "non-canonical spelling of a UUID",
+			method: http.MethodPatch,
+			path:   "/v2/" + repo + "/blobs/uploads/3f2504e04f8941d39a0c0305e82c3301",
 			status: http.StatusNotFound,
 			code:   "BLOB_UPLOAD_UNKNOWN",
 		},

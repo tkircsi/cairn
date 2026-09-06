@@ -109,6 +109,14 @@ unreferenced blob, which is inert.
 a cache of it, set from what was actually written rather than from an increment,
 so a lost response cannot desynchronise the offset a client resumes from.
 
+**Session IDs are v4 UUIDs, in canonical form only.** end-4a requires the
+`Location` to contain a UUID, and randomness rather than a clock matters
+independently: possession of the session URL is the only thing protecting an
+in-progress upload, so a guessable ID would let a third party append to it.
+Non-canonical spellings that `uuid.Parse` happens to accept — `urn:uuid:`,
+braces, unhyphenated — are rejected, since the ID is the one part of a request
+that becomes a filesystem path.
+
 **Non-contiguous chunks are refused, not reconciled.** Accepting a chunk that
 does not start where the last one ended would leave a gap in the middle of a
 blob, and the digest check at close would then fail with nothing to point at.

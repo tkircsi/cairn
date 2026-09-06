@@ -8,14 +8,13 @@
 package uploadstore
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -183,7 +182,7 @@ func (f *FS) Discard(id string) error {
 //
 // The identifier is the only part of an upload request that reaches the
 // filesystem, so it is re-validated here at the point of use rather than trusted
-// to have been checked by the caller. Rejecting anything but lower-case hex
+// to have been checked by the caller. A canonical UUID is hex and dashes, which
 // leaves no room for "..", "/" or a NUL byte to appear in the path.
 func (f *FS) path(id string) (string, error) {
 	if !ValidID(id) {
@@ -193,38 +192,37 @@ func (f *FS) path(id string) (string, error) {
 	return filepath.Join(f.root, id), nil
 }
 
-// idLength is the hex length of an identifier, so 16 random bytes.
-const idLength = 32
-
 // NewID returns an unguessable session identifier.
 //
-// The session URL is the only thing standing between an in-progress upload and
-// anyone else who can reach the registry: the spec has no notion of an upload
-// belonging to a client beyond possession of its location. A sequential or
-// otherwise predictable identifier would let a third party append bytes to
-// somebody else's upload, so this comes from a CSPRNG.
+// A UUID because end-4a requires one: "The <location> MUST contain a UUID
+// representing a unique session ID for the upload to follow."
+//
+// Version 4 specifically, so the value is random rather than derived from a
+// clock or a MAC address. That matters beyond the MUST: the session URL is the
+// only thing standing between an in-progress upload and anyone else who can
+// reach the registry, since the spec has no notion of an upload belonging to a
+// client beyond possession of its location. A time-ordered identifier would let a
+// third party guess a neighbouring session and append bytes to it.
 func NewID() (string, error) {
-	var raw [idLength / 2]byte
-
-	if _, err := rand.Read(raw[:]); err != nil {
+	id, err := uuid.NewRandom()
+	if err != nil {
 		return "", fmt.Errorf("generate upload id: %w", err)
 	}
 
-	return hex.EncodeToString(raw[:]), nil
+	return id.String(), nil
 }
 
-// ValidID reports whether id has the form NewID produces.
+// ValidID reports whether id is in the canonical form NewID produces.
+//
+// The round-trip through String is the actual check. uuid.Parse also accepts the
+// urn:uuid: prefix, brace-wrapped and unhyphenated forms, and those would reach
+// path construction as strings this package never issued -- one of them carrying
+// a colon. Requiring the canonical spelling leaves exactly one accepted shape.
 func ValidID(id string) bool {
-	if len(id) != idLength {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
 		return false
 	}
 
-	for i := 0; i < len(id); i++ {
-		c := id[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-
-	return true
+	return parsed.String() == id
 }
