@@ -7,10 +7,8 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -21,28 +19,6 @@ import (
 )
 
 const schema = `
-CREATE TABLE IF NOT EXISTS manifests (
-    repository    TEXT    NOT NULL,
-    digest        TEXT    NOT NULL,
-    media_type    TEXT    NOT NULL,
-    artifact_type TEXT    NOT NULL DEFAULT '',
-    subject       TEXT    NOT NULL DEFAULT '',
-    size          INTEGER NOT NULL,
-    annotations   TEXT    NOT NULL DEFAULT '{}',
-    created_at    TEXT    NOT NULL,
-    PRIMARY KEY (repository, digest)
-) WITHOUT ROWID;
-
--- This index is the entire point of the project. It answers end-12a directly,
--- which is the query a path-addressed registry cannot answer and therefore
--- delegates to a client-maintained sha256-<subject> document.
---
--- Partial, because only manifests that carry a subject are referrers, and those
--- are a small minority of rows.
-CREATE INDEX IF NOT EXISTS manifests_by_subject
-    ON manifests (repository, subject, artifact_type, digest)
-    WHERE subject <> '';
-
 CREATE TABLE IF NOT EXISTS blobs (
     repository TEXT    NOT NULL,
     digest     TEXT    NOT NULL,
@@ -50,14 +26,24 @@ CREATE TABLE IF NOT EXISTS blobs (
     created_at TEXT    NOT NULL,
     PRIMARY KEY (repository, digest)
 ) WITHOUT ROWID;
-`
 
-// Note on what is deliberately absent: there is no foreign key from
-// manifests.subject to manifests.digest. The spec requires a registry to accept
-// a manifest whose subject names content that is not present -- the conformance
-// suite pushes exactly that case -- so a foreign key here would fail
-// conformance. Cascading a subject delete onto its referrers is therefore a
-// policy this store *can* express but does not impose.
+-- The primary key answers "does this repository hold this blob", which is the
+-- read path. This index answers "does anyone hold it", which is what a
+-- cross-repository mount asks and what a garbage collector would need.
+CREATE INDEX IF NOT EXISTS blobs_by_digest ON blobs (digest);
+
+CREATE TABLE IF NOT EXISTS uploads (
+    id         TEXT    NOT NULL PRIMARY KEY,
+    repository TEXT    NOT NULL,
+    received   INTEGER NOT NULL DEFAULT 0,
+    started_at TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL
+) WITHOUT ROWID;
+
+-- Sessions are the only rows that expire. Ordering by age is how a sweeper finds
+-- the abandoned ones, which otherwise accumulate staged bytes forever.
+CREATE INDEX IF NOT EXISTS uploads_by_updated_at ON uploads (updated_at);
+`
 
 // Store is a SQLite-backed metastore.
 type Store struct {
@@ -94,57 +80,125 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) PutManifest(ctx context.Context, m model.Manifest) error {
-	annotations, err := json.Marshal(m.Annotations)
-	if err != nil {
-		return fmt.Errorf("encode annotations: %w", err)
-	}
-
-	// Manifests are immutable at a digest, so a repeat push has nothing to
-	// change. This is what makes the write path idempotent.
+func (s *Store) PutBlob(ctx context.Context, b model.Blob) error {
 	const query = `
-INSERT INTO manifests (repository, digest, media_type, artifact_type, subject, size, annotations, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO blobs (repository, digest, size, created_at)
+VALUES (?, ?, ?, ?)
 ON CONFLICT (repository, digest) DO NOTHING`
 
-	_, err = s.db.ExecContext(ctx, query,
-		m.Repository, m.Digest.String(), m.MediaType, m.ArtifactType,
-		m.Subject.String(), m.Size, string(annotations), m.CreatedAt.UTC().Format(time.RFC3339Nano),
+	_, err := s.db.ExecContext(ctx, query,
+		b.Repository, b.Digest.String(), b.Size, formatTime(b.CreatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("insert manifest: %w", err)
+		return fmt.Errorf("insert blob: %w", err)
 	}
 
 	return nil
 }
 
-func (s *Store) Manifest(ctx context.Context, repository string, dgst digest.Digest) (model.Manifest, error) {
+func (s *Store) Blob(ctx context.Context, repository string, dgst digest.Digest) (model.Blob, error) {
 	const query = `
-SELECT digest, media_type, artifact_type, subject, size, annotations, created_at
-FROM manifests
+SELECT repository, digest, size, created_at
+FROM blobs
 WHERE repository = ? AND digest = ?`
 
-	row := s.db.QueryRowContext(ctx, query, repository, dgst.String())
-
-	m, err := scanManifest(repository, row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return model.Manifest{}, metastore.ErrNotFound
-	}
-
-	return m, err
+	return scanBlob(s.db.QueryRowContext(ctx, query, repository, dgst.String()))
 }
 
-func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error {
-	const query = `DELETE FROM manifests WHERE repository = ? AND digest = ?`
+func (s *Store) AnyBlob(ctx context.Context, dgst digest.Digest) (model.Blob, error) {
+	// LIMIT 1 because the question is existence, not enumeration: the bytes are
+	// identical in every repository that holds them, so the first row answers it.
+	const query = `
+SELECT repository, digest, size, created_at
+FROM blobs
+WHERE digest = ?
+LIMIT 1`
 
-	result, err := s.db.ExecContext(ctx, query, repository, dgst.String())
+	return scanBlob(s.db.QueryRowContext(ctx, query, dgst.String()))
+}
+
+func (s *Store) DeleteBlob(ctx context.Context, repository string, dgst digest.Digest) error {
+	// Only the membership row goes. The bytes stay, because another repository
+	// may hold the same digest and this store has no way to know it is the last
+	// reference without a sweep it does not perform.
+	const query = `DELETE FROM blobs WHERE repository = ? AND digest = ?`
+
+	return s.execExpectingRow(ctx, query, repository, dgst.String())
+}
+
+func (s *Store) CreateUpload(ctx context.Context, u model.Upload) error {
+	const query = `
+INSERT INTO uploads (id, repository, received, started_at, updated_at)
+VALUES (?, ?, ?, ?, ?)`
+
+	_, err := s.db.ExecContext(ctx, query,
+		u.ID, u.Repository, u.Received, formatTime(u.StartedAt), formatTime(u.UpdatedAt),
+	)
 	if err != nil {
-		return fmt.Errorf("delete manifest: %w", err)
+		return fmt.Errorf("insert upload: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) Upload(ctx context.Context, id string) (model.Upload, error) {
+	const query = `
+SELECT id, repository, received, started_at, updated_at
+FROM uploads
+WHERE id = ?`
+
+	var (
+		u         model.Upload
+		startedAt string
+		updatedAt string
+	)
+
+	err := s.db.QueryRowContext(ctx, query, id).
+		Scan(&u.ID, &u.Repository, &u.Received, &startedAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Upload{}, metastore.ErrNotFound
+	}
+
+	if err != nil {
+		return model.Upload{}, fmt.Errorf("scan upload: %w", err)
+	}
+
+	if u.StartedAt, err = parseTime(startedAt); err != nil {
+		return model.Upload{}, err
+	}
+
+	if u.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return model.Upload{}, err
+	}
+
+	return u, nil
+}
+
+func (s *Store) SetUploadReceived(ctx context.Context, id string, received int64, at time.Time) error {
+	const query = `UPDATE uploads SET received = ?, updated_at = ? WHERE id = ?`
+
+	return s.execExpectingRow(ctx, query, received, formatTime(at), id)
+}
+
+func (s *Store) DeleteUpload(ctx context.Context, id string) error {
+	const query = `DELETE FROM uploads WHERE id = ?`
+
+	return s.execExpectingRow(ctx, query, id)
+}
+
+// execExpectingRow runs a statement that must affect exactly one row, reporting
+// ErrNotFound when it affects none. Without this, deleting a session that does
+// not exist would look like success and the caller could not answer
+// BLOB_UPLOAD_UNKNOWN.
+func (s *Store) execExpectingRow(ctx context.Context, query string, args ...any) error {
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("exec: %w", err)
 	}
 
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("delete manifest: %w", err)
+		return fmt.Errorf("rows affected: %w", err)
 	}
 
 	if affected == 0 {
@@ -154,114 +208,40 @@ func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst dige
 	return nil
 }
 
-func (s *Store) PutBlob(ctx context.Context, b model.Blob) error {
-	const query = `
-INSERT INTO blobs (repository, digest, size, created_at)
-VALUES (?, ?, ?, ?)
-ON CONFLICT (repository, digest) DO NOTHING`
-
-	_, err := s.db.ExecContext(ctx, query,
-		b.Repository, b.Digest.String(), b.Size, b.CreatedAt.UTC().Format(time.RFC3339Nano),
-	)
-	if err != nil {
-		return fmt.Errorf("insert blob: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Store) Referrers(ctx context.Context, q metastore.ReferrersQuery) ([]model.Manifest, error) {
-	// Conditions are assembled from a fixed set of clauses and every value is
-	// bound, so no caller input reaches the SQL text.
-	conditions := []string{"repository = ?", "subject = ?"}
-	args := []any{q.Repository, q.Subject.String()}
-
-	if q.ArtifactType != "" {
-		conditions = append(conditions, "artifact_type = ?")
-		args = append(args, q.ArtifactType)
-	}
-
-	if q.After != "" {
-		conditions = append(conditions, "digest > ?")
-		args = append(args, q.After.String())
-	}
-
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-
-	args = append(args, limit)
-
-	// Ordering by digest matches the index, so the page is read straight off it
-	// with no sort, and keyset pagination makes the last page as cheap as the
-	// first.
-	query := `
-SELECT digest, media_type, artifact_type, subject, size, annotations, created_at
-FROM manifests
-WHERE ` + strings.Join(conditions, " AND ") + `
-ORDER BY digest
-LIMIT ?`
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("query referrers: %w", err)
-	}
-	defer rows.Close()
-
-	var referrers []model.Manifest
-
-	for rows.Next() {
-		m, err := scanManifest(q.Repository, rows)
-		if err != nil {
-			return nil, err
-		}
-
-		referrers = append(referrers, m)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("scan referrers: %w", err)
-	}
-
-	return referrers, nil
-}
-
-// scanner is satisfied by both *sql.Row and *sql.Rows.
-type scanner interface {
-	Scan(dest ...any) error
-}
-
-func scanManifest(repository string, src scanner) (model.Manifest, error) {
+func scanBlob(row *sql.Row) (model.Blob, error) {
 	var (
-		m           model.Manifest
-		dgst        string
-		subject     string
-		annotations string
-		createdAt   string
+		b         model.Blob
+		dgst      string
+		createdAt string
 	)
 
-	if err := src.Scan(&dgst, &m.MediaType, &m.ArtifactType, &subject, &m.Size, &annotations, &createdAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return model.Manifest{}, err
-		}
-
-		return model.Manifest{}, fmt.Errorf("scan manifest: %w", err)
+	err := row.Scan(&b.Repository, &dgst, &b.Size, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Blob{}, metastore.ErrNotFound
 	}
 
-	if err := json.Unmarshal([]byte(annotations), &m.Annotations); err != nil {
-		return model.Manifest{}, fmt.Errorf("decode annotations: %w", err)
-	}
-
-	created, err := time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
-		return model.Manifest{}, fmt.Errorf("parse created_at: %w", err)
+		return model.Blob{}, fmt.Errorf("scan blob: %w", err)
 	}
 
-	m.Repository = repository
-	m.Digest = digest.Digest(dgst)
-	m.Subject = digest.Digest(subject)
-	m.CreatedAt = created
+	b.Digest = digest.Digest(dgst)
 
-	return m, nil
+	if b.CreatedAt, err = parseTime(createdAt); err != nil {
+		return model.Blob{}, err
+	}
+
+	return b, nil
+}
+
+// Times are stored as UTC RFC3339 text: it sorts lexically in the same order it
+// sorts chronologically, so an index on a timestamp column is usable directly.
+func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+func parseTime(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse timestamp %q: %w", s, err)
+	}
+
+	return t, nil
 }

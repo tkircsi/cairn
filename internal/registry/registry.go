@@ -1,127 +1,411 @@
-// Package registry composes the blob store and the metadata index into the
-// operations both API surfaces call.
+// Package registry composes the blob store, the upload area and the metadata
+// index into the operations the HTTP surface calls.
 //
-// This is the only layer that understands what a manifest means. Both the gRPC
-// write API and the OCI HTTP read API go through it, so there is one place where
-// digests are derived, manifests are parsed and writes are ordered -- and hence
-// no way for the two surfaces to disagree about what is stored.
+// This is the only layer that knows the rules: that a digest is verified before
+// content is promoted, that a chunk must be contiguous, and that a blob is
+// readable only from a repository that pushed it. The handler above it is left
+// to translate those outcomes into status codes.
 package registry
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/opencontainers/go-digest"
-	specs "github.com/opencontainers/image-spec/specs-go"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
 	"github.com/tkircsi/cairn/internal/blobstore"
 	"github.com/tkircsi/cairn/internal/metastore"
 	"github.com/tkircsi/cairn/internal/model"
+	"github.com/tkircsi/cairn/internal/uploadstore"
 )
 
-// ErrNotFound is returned when the requested content is absent.
-var ErrNotFound = errors.New("not found")
+// Failure modes the HTTP layer has to distinguish, because the spec gives each
+// one a different status code and error code.
+var (
+	// ErrNotFound covers a blob absent from the repository being read.
+	ErrNotFound = errors.New("not found")
+	// ErrUploadUnknown is a session that does not exist, or no longer does.
+	ErrUploadUnknown = errors.New("upload unknown")
+	// ErrDigestMismatch is a completed upload whose content does not hash to the
+	// digest the client claimed.
+	ErrDigestMismatch = errors.New("digest mismatch")
+	// ErrNotContiguous is a chunk that does not begin where the last one ended.
+	ErrNotContiguous = errors.New("chunk is not contiguous")
+	// ErrTooLarge is an upload that exceeded the configured ceiling.
+	ErrTooLarge = errors.New("upload exceeds the maximum blob size")
+)
+
+// DefaultMaxBlobSize caps a single blob.
+//
+// Uploads are unauthenticated writes of unbounded length in the bare spec, so
+// without a ceiling one client can fill the disk. The number is a policy, not a
+// spec requirement, which is why it is an option.
+const DefaultMaxBlobSize int64 = 1 << 30 // 1 GiB
 
 // Registry is the service layer.
 type Registry struct {
-	blobs blobstore.Store
-	meta  metastore.Store
-	now   func() time.Time
+	blobs   blobstore.Store
+	uploads uploadstore.Store
+	meta    metastore.Store
+
+	maxBlobSize int64
+	now         func() time.Time
+}
+
+// Option adjusts a Registry.
+type Option func(*Registry)
+
+// WithMaxBlobSize sets the per-blob ceiling.
+func WithMaxBlobSize(n int64) Option {
+	return func(r *Registry) { r.maxBlobSize = n }
+}
+
+// WithClock replaces the clock, so tests can assert on timestamps.
+func WithClock(fn func() time.Time) Option {
+	return func(r *Registry) { r.now = fn }
 }
 
 // New builds a Registry over the given backends.
-func New(blobs blobstore.Store, meta metastore.Store) *Registry {
-	return &Registry{blobs: blobs, meta: meta, now: time.Now}
+func New(
+	blobs blobstore.Store,
+	uploads uploadstore.Store,
+	meta metastore.Store,
+	opts ...Option,
+) *Registry {
+	r := &Registry{
+		blobs:       blobs,
+		uploads:     uploads,
+		meta:        meta,
+		maxBlobSize: DefaultMaxBlobSize,
+		now:         time.Now,
+	}
+
+	for _, opt := range opts {
+		opt(r)
+	}
+
+	return r
 }
 
-// PutBlob stores bytes and records their membership in a repository.
-func (r *Registry) PutBlob(ctx context.Context, repository string, data []byte) (digest.Digest, error) {
-	dgst, err := r.blobs.Put(data)
+// StartUpload opens a session and returns it.
+func (r *Registry) StartUpload(ctx context.Context, repository string) (model.Upload, error) {
+	id, err := uploadstore.NewID()
 	if err != nil {
-		return "", fmt.Errorf("store blob: %w", err)
+		return model.Upload{}, err
+	}
+
+	// Staging file first, row second. The reverse order can produce a session a
+	// client is told to use but that has nowhere to put bytes; this order can at
+	// worst leave a zero-length file no request can name.
+	if err := r.uploads.Create(id); err != nil {
+		return model.Upload{}, err
+	}
+
+	now := r.now()
+
+	upload := model.Upload{
+		ID:         id,
+		Repository: repository,
+		Received:   0,
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+
+	if err := r.meta.CreateUpload(ctx, upload); err != nil {
+		// Nothing can reach the file now, so drop it rather than leave it to the
+		// sweeper.
+		_ = r.uploads.Discard(id)
+
+		return model.Upload{}, err
+	}
+
+	return upload, nil
+}
+
+// UploadStatus reports how much of a session has been received.
+func (r *Registry) UploadStatus(ctx context.Context, id string) (model.Upload, error) {
+	upload, err := r.meta.Upload(ctx, id)
+	if err != nil {
+		if errors.Is(err, metastore.ErrNotFound) {
+			return model.Upload{}, ErrUploadUnknown
+		}
+
+		return model.Upload{}, err
+	}
+
+	return upload, nil
+}
+
+// AppendUpload adds bytes to a session.
+//
+// start is the offset the caller claims the chunk begins at, or -1 when it made
+// no claim, which the spec permits for a streamed upload. A claim that disagrees
+// with what the session holds is refused rather than reconciled: silently
+// accepting it would leave a gap or a duplication in the middle of a blob, and
+// the digest check at close would then fail with nothing to point at.
+func (r *Registry) AppendUpload(
+	ctx context.Context,
+	id string,
+	start int64,
+	body io.Reader,
+) (model.Upload, error) {
+	upload, err := r.UploadStatus(ctx, id)
+	if err != nil {
+		return model.Upload{}, err
+	}
+
+	if start >= 0 && start != upload.Received {
+		return model.Upload{}, fmt.Errorf("%w: session holds %d bytes, chunk starts at %d",
+			ErrNotContiguous, upload.Received, start)
+	}
+
+	remaining := r.maxBlobSize - upload.Received
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Read one byte past the ceiling: enough to detect the overrun without
+	// consuming a body that may be arbitrarily long.
+	received, err := r.uploads.Append(id, io.LimitReader(body, remaining+1))
+	if err != nil {
+		if errors.Is(err, uploadstore.ErrNotFound) {
+			return model.Upload{}, ErrUploadUnknown
+		}
+
+		return model.Upload{}, err
+	}
+
+	if received > r.maxBlobSize {
+		// The staged bytes can never become a valid blob, so the session goes
+		// rather than lingering at an over-limit offset.
+		_ = r.discard(ctx, id)
+
+		return model.Upload{}, fmt.Errorf("%w: %d bytes exceeds %d",
+			ErrTooLarge, received, r.maxBlobSize)
+	}
+
+	// The file's length is authoritative and the row is a cache of it, so the
+	// row is set from what was actually written rather than from an increment.
+	if err := r.meta.SetUploadReceived(ctx, id, received, r.now()); err != nil {
+		return model.Upload{}, err
+	}
+
+	upload.Received = received
+
+	return upload, nil
+}
+
+// CompleteUpload verifies the staged bytes against expected and, only if they
+// agree, promotes them into the blob store.
+//
+// body may carry a final chunk, which the spec allows a close to do.
+func (r *Registry) CompleteUpload(
+	ctx context.Context,
+	id string,
+	body io.Reader,
+	expected digest.Digest,
+) (model.Blob, error) {
+	upload, err := r.UploadStatus(ctx, id)
+	if err != nil {
+		return model.Blob{}, err
+	}
+
+	if body != nil {
+		if upload, err = r.AppendUpload(ctx, id, -1, body); err != nil {
+			return model.Blob{}, err
+		}
+	}
+
+	actual, err := r.uploads.Digest(id)
+	if err != nil {
+		if errors.Is(err, uploadstore.ErrNotFound) {
+			return model.Blob{}, ErrUploadUnknown
+		}
+
+		return model.Blob{}, err
+	}
+
+	// Verified before the promotion, not after. Checking afterwards would mean
+	// either trusting the claim for a moment or deleting a blob at its true
+	// digest to undo the mistake -- and those bytes may be ones another
+	// repository legitimately holds.
+	//
+	// The session survives a mismatch: the content is whatever it is, so a client
+	// that miscomputed the digest can simply close again with the right one.
+	if actual != expected {
+		return model.Blob{}, fmt.Errorf("%w: content hashes to %s, not %s",
+			ErrDigestMismatch, actual, expected)
+	}
+
+	staged, err := r.uploads.Open(id)
+	if err != nil {
+		return model.Blob{}, err
+	}
+
+	dgst, size, err := r.blobs.Put(staged)
+
+	closeErr := staged.Close()
+
+	if err != nil {
+		return model.Blob{}, err
+	}
+
+	if closeErr != nil {
+		return model.Blob{}, fmt.Errorf("close staged upload: %w", closeErr)
 	}
 
 	blob := model.Blob{
-		Repository: repository,
+		Repository: upload.Repository,
 		Digest:     dgst,
-		Size:       int64(len(data)),
+		Size:       size,
 		CreatedAt:  r.now(),
 	}
 
 	if err := r.meta.PutBlob(ctx, blob); err != nil {
-		return "", fmt.Errorf("index blob: %w", err)
+		return model.Blob{}, err
 	}
 
-	return dgst, nil
+	// The session has served its purpose. A failure to clean up is not the
+	// client's problem -- the blob is committed and readable -- so it only costs
+	// a stale row for the sweeper.
+	_ = r.discard(ctx, id)
+
+	return blob, nil
 }
 
-// PutManifest parses, stores and indexes a manifest, returning its digest and
-// the subject it refers to, if any.
-func (r *Registry) PutManifest(ctx context.Context, repository string, data []byte) (digest.Digest, digest.Digest, error) {
-	parsed, err := parseManifest(data)
-	if err != nil {
-		return "", "", err
+// CancelUpload abandons a session and its staged bytes.
+func (r *Registry) CancelUpload(ctx context.Context, id string) error {
+	if _, err := r.UploadStatus(ctx, id); err != nil {
+		return err
 	}
 
-	// Blobs first, metadata second. The reverse order can leave an index row
-	// pointing at content that is not there, which reads as corruption; this
-	// order can at worst leave an unreferenced blob, which is inert.
-	dgst, err := r.blobs.Put(data)
-	if err != nil {
-		return "", "", fmt.Errorf("store manifest: %w", err)
-	}
-
-	manifest := model.Manifest{
-		Repository:   repository,
-		Digest:       dgst,
-		MediaType:    parsed.mediaType,
-		ArtifactType: parsed.artifactType,
-		Subject:      parsed.subject,
-		Size:         int64(len(data)),
-		Annotations:  parsed.annotations,
-		CreatedAt:    r.now(),
-	}
-
-	if err := r.meta.PutManifest(ctx, manifest); err != nil {
-		return "", "", fmt.Errorf("index manifest: %w", err)
-	}
-
-	return dgst, parsed.subject, nil
+	return r.discard(ctx, id)
 }
 
-// Manifest returns the raw manifest bytes and their media type.
-func (r *Registry) Manifest(ctx context.Context, repository string, dgst digest.Digest) ([]byte, string, error) {
-	manifest, err := r.meta.Manifest(ctx, repository, dgst)
+func (r *Registry) discard(ctx context.Context, id string) error {
+	if err := r.uploads.Discard(id); err != nil && !errors.Is(err, uploadstore.ErrNotFound) {
+		return err
+	}
+
+	if err := r.meta.DeleteUpload(ctx, id); err != nil && !errors.Is(err, metastore.ErrNotFound) {
+		return err
+	}
+
+	return nil
+}
+
+// MountBlob makes a blob readable from another repository without transferring
+// it.
+//
+// This is the endpoint that justifies the membership table: the bytes are
+// already on disk under their digest, so granting a second repository access to
+// them is the insertion of one row. from may be empty, in which case any
+// repository holding the blob will do.
+func (r *Registry) MountBlob(
+	ctx context.Context,
+	target, from string,
+	dgst digest.Digest,
+) (model.Blob, error) {
+	var (
+		source model.Blob
+		err    error
+	)
+
+	if from != "" {
+		source, err = r.meta.Blob(ctx, from, dgst)
+	} else {
+		source, err = r.meta.AnyBlob(ctx, dgst)
+	}
+
 	if err != nil {
 		if errors.Is(err, metastore.ErrNotFound) {
-			return nil, "", ErrNotFound
+			return model.Blob{}, ErrNotFound
 		}
 
-		return nil, "", err
+		return model.Blob{}, err
 	}
 
-	data, err := r.blobs.Get(dgst)
-	if err != nil {
+	// The index says the blob exists; confirm the bytes agree before handing the
+	// client a location it can read, so a mount cannot manufacture a dangling
+	// reference out of a stale row.
+	if _, err := r.blobs.Stat(dgst); err != nil {
 		if errors.Is(err, blobstore.ErrNotFound) {
-			return nil, "", ErrNotFound
+			return model.Blob{}, ErrNotFound
 		}
 
-		return nil, "", err
+		return model.Blob{}, err
 	}
 
-	return data, manifest.MediaType, nil
+	blob := model.Blob{
+		Repository: target,
+		Digest:     dgst,
+		Size:       source.Size,
+		CreatedAt:  r.now(),
+	}
+
+	if err := r.meta.PutBlob(ctx, blob); err != nil {
+		return model.Blob{}, err
+	}
+
+	return blob, nil
 }
 
-// DeleteManifest removes a manifest from the index.
+// StatBlob reports a blob's size, or ErrNotFound if this repository cannot read
+// it.
+func (r *Registry) StatBlob(
+	ctx context.Context,
+	repository string,
+	dgst digest.Digest,
+) (model.Blob, error) {
+	blob, err := r.meta.Blob(ctx, repository, dgst)
+	if err != nil {
+		if errors.Is(err, metastore.ErrNotFound) {
+			return model.Blob{}, ErrNotFound
+		}
+
+		return model.Blob{}, err
+	}
+
+	return blob, nil
+}
+
+// OpenBlob returns a handle to a blob's bytes.
 //
-// The blob is left alone: it may be shared, and reclaiming it is a separate
-// concern. Note what does not happen -- referrers of this manifest are not
-// touched, because the spec permits a subject to be absent.
-func (r *Registry) DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error {
-	if err := r.meta.DeleteManifest(ctx, repository, dgst); err != nil {
+// Membership is checked first and the content second. That order is what scopes
+// reads: a caller asking a repository for a digest it never pushed gets
+// ErrNotFound even though the bytes are sitting in the shared store.
+func (r *Registry) OpenBlob(
+	ctx context.Context,
+	repository string,
+	dgst digest.Digest,
+) (io.ReadSeekCloser, model.Blob, error) {
+	blob, err := r.StatBlob(ctx, repository, dgst)
+	if err != nil {
+		return nil, model.Blob{}, err
+	}
+
+	content, err := r.blobs.Open(dgst)
+	if err != nil {
+		if errors.Is(err, blobstore.ErrNotFound) {
+			return nil, model.Blob{}, ErrNotFound
+		}
+
+		return nil, model.Blob{}, err
+	}
+
+	return content, blob, nil
+}
+
+// DeleteBlob drops a repository's access to a blob.
+//
+// The bytes are left alone. Another repository may hold the same digest, and
+// deciding that this was the last reference needs a sweep this store does not
+// perform.
+func (r *Registry) DeleteBlob(ctx context.Context, repository string, dgst digest.Digest) error {
+	if err := r.meta.DeleteBlob(ctx, repository, dgst); err != nil {
 		if errors.Is(err, metastore.ErrNotFound) {
 			return ErrNotFound
 		}
@@ -130,120 +414,4 @@ func (r *Registry) DeleteManifest(ctx context.Context, repository string, dgst d
 	}
 
 	return nil
-}
-
-// ReferrersPage is one page of a referrers response.
-type ReferrersPage struct {
-	Index ocispec.Index
-	// Next is the digest to resume after, empty when the page is the last.
-	Next digest.Digest
-}
-
-// Referrers answers end-12a and end-12b.
-//
-// An unknown subject is not an error: the spec requires a 200 with an empty
-// manifest list, and a registry that supports the API must never answer 404
-// here, because a 404 is precisely the signal that sends clients back to the
-// fallback tag scheme.
-func (r *Registry) Referrers(
-	ctx context.Context,
-	repository string,
-	subject digest.Digest,
-	artifactType string,
-	limit int,
-	after digest.Digest,
-) (ReferrersPage, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-
-	// Ask for one extra row to learn whether another page exists, without a
-	// second COUNT query.
-	found, err := r.meta.Referrers(ctx, metastore.ReferrersQuery{
-		Repository:   repository,
-		Subject:      subject,
-		ArtifactType: artifactType,
-		Limit:        limit + 1,
-		After:        after,
-	})
-	if err != nil {
-		return ReferrersPage{}, err
-	}
-
-	var next digest.Digest
-
-	if len(found) > limit {
-		found = found[:limit]
-		next = found[len(found)-1].Digest
-	}
-
-	// manifests must marshal as [] rather than null when empty, so that the
-	// response is a valid image index for a subject with no referrers.
-	descriptors := make([]ocispec.Descriptor, 0, len(found))
-	for _, m := range found {
-		descriptors = append(descriptors, m.Descriptor())
-	}
-
-	page := ReferrersPage{
-		Index: ocispec.Index{
-			Versioned: specs.Versioned{SchemaVersion: 2},
-			MediaType: ocispec.MediaTypeImageIndex,
-			Manifests: descriptors,
-		},
-		Next: next,
-	}
-
-	return page, nil
-}
-
-// parsedManifest is what the store needs to read out of manifest bytes.
-type parsedManifest struct {
-	mediaType    string
-	artifactType string
-	subject      digest.Digest
-	annotations  map[string]string
-}
-
-// parseManifest reads the indexable fields out of a manifest.
-//
-// Metadata is derived from the bytes rather than accepted alongside them, which
-// is what makes it impossible for the index to describe something the content
-// does not say.
-func parseManifest(data []byte) (parsedManifest, error) {
-	// ocispec.Manifest is a structural superset of what is needed from either
-	// document: an index carries mediaType, artifactType, subject and
-	// annotations too, and simply leaves Config zero. Config is only consulted
-	// for image manifests, so an index never reads that zero value.
-	var raw ocispec.Manifest
-
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return parsedManifest{}, fmt.Errorf("parse manifest: %w", err)
-	}
-
-	if raw.MediaType == "" {
-		return parsedManifest{}, errors.New("manifest has no mediaType")
-	}
-
-	parsed := parsedManifest{
-		mediaType:    raw.MediaType,
-		artifactType: raw.ArtifactType,
-		annotations:  raw.Annotations,
-	}
-
-	// The spec's fallback rule for the artifactType a referrers descriptor must
-	// carry: on an image manifest an empty artifactType means the config
-	// descriptor's mediaType; on an index it stays empty and is omitted.
-	if parsed.artifactType == "" && raw.MediaType == ocispec.MediaTypeImageManifest {
-		parsed.artifactType = raw.Config.MediaType
-	}
-
-	if raw.Subject != nil {
-		if err := raw.Subject.Digest.Validate(); err != nil {
-			return parsedManifest{}, fmt.Errorf("invalid subject digest: %w", err)
-		}
-
-		parsed.subject = raw.Subject.Digest
-	}
-
-	return parsed, nil
 }
