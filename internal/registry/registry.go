@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -53,6 +54,7 @@ type Registry struct {
 
 	maxBlobSize int64
 	now         func() time.Time
+	log         *slog.Logger
 }
 
 // Option adjusts a Registry.
@@ -68,6 +70,15 @@ func WithClock(fn func() time.Time) Option {
 	return func(r *Registry) { r.now = fn }
 }
 
+// WithLogger sets where domain events go.
+func WithLogger(logger *slog.Logger) Option {
+	return func(r *Registry) {
+		if logger != nil {
+			r.log = logger
+		}
+	}
+}
+
 // New builds a Registry over the given backends.
 func New(
 	blobs blobstore.Store,
@@ -81,6 +92,7 @@ func New(
 		meta:        meta,
 		maxBlobSize: DefaultMaxBlobSize,
 		now:         time.Now,
+		log:         slog.Default(),
 	}
 
 	for _, opt := range opts {
@@ -179,6 +191,15 @@ func (r *Registry) AppendUpload(
 	}
 
 	if received > r.maxBlobSize {
+		// Logged because it is a resource-exhaustion attempt as much as a client
+		// error, and the access log cannot show the size that was refused.
+		r.log.WarnContext(ctx, "upload exceeded the size limit",
+			slog.String("upload", id),
+			slog.String("repository", upload.Repository),
+			slog.Int64("received", received),
+			slog.Int64("limit", r.maxBlobSize),
+		)
+
 		// The staged bytes can never become a valid blob, so the session goes
 		// rather than lingering at an over-limit offset.
 		_ = r.discard(ctx, id)
@@ -236,6 +257,16 @@ func (r *Registry) CompleteUpload(
 	// The session survives a mismatch: the content is whatever it is, so a client
 	// that miscomputed the digest can simply close again with the right one.
 	if actual != expected {
+		// Both digests are recorded, because the pair is the whole diagnostic: a
+		// client bug produces a stable mismatch, a truncated transfer a varying one.
+		r.log.WarnContext(ctx, "upload digest mismatch",
+			slog.String("upload", id),
+			slog.String("repository", upload.Repository),
+			slog.String("claimed", expected.String()),
+			slog.String("actual", actual.String()),
+			slog.Int64("received", upload.Received),
+		)
+
 		return model.Blob{}, fmt.Errorf("%w: content hashes to %s, not %s",
 			ErrDigestMismatch, actual, expected)
 	}
@@ -267,6 +298,12 @@ func (r *Registry) CompleteUpload(
 	if err := r.meta.PutBlob(ctx, blob); err != nil {
 		return model.Blob{}, err
 	}
+
+	r.log.InfoContext(ctx, "blob committed",
+		slog.String("repository", blob.Repository),
+		slog.String("digest", blob.Digest.String()),
+		slog.Int64("size", blob.Size),
+	)
 
 	// The session has served its purpose. A failure to clean up is not the
 	// client's problem -- the blob is committed and readable -- so it only costs
@@ -349,6 +386,14 @@ func (r *Registry) MountBlob(
 	if err := r.meta.PutBlob(ctx, blob); err != nil {
 		return model.Blob{}, err
 	}
+
+	// Worth a record of its own: this is the one way a blob becomes readable from
+	// a repository that never uploaded it, so the grant should be auditable.
+	r.log.InfoContext(ctx, "blob mounted",
+		slog.String("repository", blob.Repository),
+		slog.String("from", source.Repository),
+		slog.String("digest", blob.Digest.String()),
+	)
 
 	return blob, nil
 }

@@ -15,7 +15,59 @@ manifest and tag surface on top.
 go run ./cmd/cairnd -addr 127.0.0.1:5050 -root data
 ```
 
-Push a blob in one request and read it back:
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-addr` | `127.0.0.1:5050` | address to listen on |
+| `-root` | `data` | directory holding `blobs/`, `uploads/` and `cairn.db` |
+| `-max-blob-size` | `1073741824` | largest blob accepted, in bytes |
+| `-log-format` | `text` | `text` or `json` |
+| `-log-level` | `info` | `debug`, `info`, `warn`, `error` |
+
+A bad `-log-format` or `-log-level` fails at startup rather than falling back to a
+default, so a typo cannot silently discard the records you asked for.
+
+## Pushing and pulling with oras
+
+cairn speaks enough of the spec for [`oras`](https://oras.land) to use it as a
+registry. It has no TLS, so `--plain-http` is required.
+
+```sh
+oras blob push --plain-http 127.0.0.1:5050/agntcy/skill ./skill_record.json
+# Pushed: [registry] 127.0.0.1:5050/agntcy/skill
+# Digest: sha256:492100945cb1786021c9bf867dd0f59510b1628c9510837df951328e07cdbab7
+```
+
+Reading it back takes the digest, not the path — `oras blob fetch` wants either
+`--output` or `--descriptor`:
+
+```sh
+DIGEST=sha256:492100945cb1786021c9bf867dd0f59510b1628c9510837df951328e07cdbab7
+
+oras blob fetch --plain-http --descriptor 127.0.0.1:5050/agntcy/skill@$DIGEST
+# {"mediaType":"application/octet-stream","digest":"sha256:4921…","size":1181}
+
+oras blob fetch --plain-http --output - 127.0.0.1:5050/agntcy/skill@$DIGEST
+oras blob fetch --plain-http --output ./got.json 127.0.0.1:5050/agntcy/skill@$DIGEST
+```
+
+Two things about that output are worth reading closely, because both are the
+data model showing through rather than quirks.
+
+The repository in the reference is part of the address, not decoration. Fetching
+the same digest from a repository it was never pushed to is a 404, even though
+the bytes are on disk — a transposed `agncty` for `agntcy` looks exactly like a
+missing blob, and correctly so.
+
+And the media type moves. `oras blob push` labels its own progress line
+`application/vnd.oci.image.layer.v1.tar`, but nothing of the sort reaches cairn:
+a blob here is bytes plus a digest. The descriptor printed back on fetch says
+`application/octet-stream` because that is simply the `Content-Type` of the
+response. Media types are recorded by the *manifest* that references a blob, which
+is why the round trip cannot preserve one yet.
+
+## Pushing and pulling with curl
+
+One request, digest supplied up front (end-4b):
 
 ```sh
 DIGEST="sha256:$(shasum -a 256 file.txt | cut -d' ' -f1)"
@@ -26,7 +78,9 @@ curl -X POST --data-binary @file.txt \
 curl "http://127.0.0.1:5050/v2/acme/widgets/blobs/$DIGEST"
 ```
 
-Or as a resumable session:
+Or as a resumable session (end-4a, 5, 6). Note that a POST *without* `?digest=`
+opens a session and discards any body you send with it — that is what the spec
+asks for, and it surprises people driving this by hand:
 
 ```sh
 SESSION=$(curl -si -X POST http://127.0.0.1:5050/v2/acme/widgets/blobs/uploads/ \
@@ -34,8 +88,22 @@ SESSION=$(curl -si -X POST http://127.0.0.1:5050/v2/acme/widgets/blobs/uploads/ 
 
 curl -X PATCH --data-binary @part1 -H 'Content-Range: 0-1023' \
   "http://127.0.0.1:5050$SESSION"
+curl "http://127.0.0.1:5050$SESSION"                      # end-13, offset so far
 curl -X PUT "http://127.0.0.1:5050$SESSION?digest=$DIGEST"
 ```
+
+Granting a second repository access to bytes already stored, transferring nothing
+(end-11):
+
+```sh
+curl -i -X POST \
+  "http://127.0.0.1:5050/v2/agntcy/mirror/blobs/uploads/?mount=$DIGEST&from=agntcy/skill"
+# HTTP/1.1 201 Created
+# Location: /v2/agntcy/mirror/blobs/sha256:4921…
+```
+
+After which the digest reads 200 from both repositories, and deleting it from one
+leaves the other untouched.
 
 ## Endpoints
 
@@ -61,6 +129,7 @@ internal/blobstore    committed bytes, addressed by digest
 internal/uploadstore  staged bytes of uploads that have no digest yet
 internal/metastore    the SQL index: blob membership and session state
 internal/model        what a row holds
+internal/logging      logger construction: format, level, destination
 ```
 
 Three storage concerns, kept apart because they have different lifetimes:
@@ -125,6 +194,39 @@ blob, and the digest check at close would then fail with nothing to point at.
 hold the same digest and deciding this was the last reference needs a sweep that
 does not exist yet. Hence end-10's 202 rather than a 204.
 
+## Logging
+
+Two streams, both `log/slog`. An access log records one entry per request; the
+registry records the handful of domain events a status code cannot express, such
+as which digest a client claimed versus what the bytes actually hashed to.
+
+```
+$ cairnd -log-format json
+{"level":"INFO","msg":"blob committed","repository":"agntcy/skill","digest":"sha256:4921…","size":1181}
+{"level":"INFO","msg":"request","method":"PUT","path":"/v2/agntcy/skill/blobs/uploads/3334433b-…","status":201,"bytes":0,"duration":5703083,"digest":"sha256:4921…"}
+{"level":"WARN","msg":"upload digest mismatch","upload":"abd49f53-…","claimed":"sha256:0000…","actual":"sha256:0da5…","received":12}
+{"level":"WARN","msg":"request","method":"GET","path":"/v2/other/repo/blobs/sha256:0da5…","status":404,"bytes":62,"duration":139958}
+```
+
+The level splits a client's mistake from the registry's: 4xx is a warning, 5xx an
+error. So `-log-level error` is a usable "only tell me when *I* am broken" filter,
+which is the main reason to bother mapping status onto level at all.
+
+Access records carry `upload` and `digest` when the response headers have them.
+That is what stitches the POST, PATCH and PUT of one chunked upload into
+something you can grep for, since a session's steps otherwise share nothing but a
+URL.
+
+Structured output is a correctness property here, not a formatting preference.
+The request path is chosen by the client, so under a printf-style log a request
+carrying CRLF plus a plausible-looking line would append a *second* entry and let
+a caller write whatever it liked into what you read. `slog` escapes it as a value;
+`TestAccessLogResistsInjection` sends exactly that and asserts one record comes
+out. Paths are also truncated, so a client cannot decide how much disk a request
+costs.
+
+Nothing emits at debug yet, so `-log-level debug` only widens the filter.
+
 ## Known gaps
 
 - No manifests, tags or referrers. An earlier revision implemented the referrers
@@ -135,6 +237,9 @@ does not exist yet. Hence end-10's 202 rather than a 204.
   only by `-max-blob-size`.
 - Blob reads through `Open` are not digest-verified, because verifying would mean
   reading the whole blob before answering and would defeat `Range` support.
+- No request ID, so an access record and the domain records emitted while serving
+  it share only a digest or upload ID. Fine at one request at a time, thin under
+  concurrency. Logs go to stderr and are not rotated.
 
 ## Tests
 

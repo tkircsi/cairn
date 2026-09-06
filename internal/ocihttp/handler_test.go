@@ -17,6 +17,7 @@ import (
 	"github.com/opencontainers/go-digest"
 
 	"github.com/tkircsi/cairn/internal/blobstore"
+	"github.com/tkircsi/cairn/internal/logging"
 	"github.com/tkircsi/cairn/internal/metastore/sqlite"
 	"github.com/tkircsi/cairn/internal/ocihttp"
 	"github.com/tkircsi/cairn/internal/registry"
@@ -52,6 +53,11 @@ func newServer(t *testing.T, opts ...registry.Option) *httptest.Server {
 	}
 
 	t.Cleanup(func() { meta.Close() })
+
+	// Discard by default: several of these tests deliberately drive the paths that
+	// log a warning, and those would otherwise print into the test output and read
+	// as failures. A test that cares about a record passes its own logger.
+	opts = append([]registry.Option{registry.WithLogger(logging.Discard())}, opts...)
 
 	server := httptest.NewServer(ocihttp.NewHandler(registry.New(blobs, uploads, meta, opts...)))
 	t.Cleanup(server.Close)

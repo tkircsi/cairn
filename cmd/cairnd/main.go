@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/tkircsi/cairn/internal/blobstore"
+	"github.com/tkircsi/cairn/internal/logging"
 	"github.com/tkircsi/cairn/internal/metastore/sqlite"
 	"github.com/tkircsi/cairn/internal/ocihttp"
 	"github.com/tkircsi/cairn/internal/registry"
@@ -24,6 +25,8 @@ import (
 
 func main() {
 	if err := run(); err != nil {
+		// The default logger, deliberately: run may have failed while building the
+		// configured one, and this must still reach stderr.
 		slog.Error("cairnd failed", "error", err)
 		os.Exit(1)
 	}
@@ -31,12 +34,23 @@ func main() {
 
 func run() error {
 	var (
-		addr    = flag.String("addr", "127.0.0.1:5050", "address to listen on")
-		root    = flag.String("root", "data", "directory for blobs, uploads and the index")
-		maxBlob = flag.Int64("max-blob-size", registry.DefaultMaxBlobSize, "largest blob accepted, in bytes")
+		addr      = flag.String("addr", "127.0.0.1:5050", "address to listen on")
+		root      = flag.String("root", "data", "directory for blobs, uploads and the index")
+		maxBlob   = flag.Int64("max-blob-size", registry.DefaultMaxBlobSize, "largest blob accepted, in bytes")
+		logFormat = flag.String("log-format", "text", "log format: text or json")
+		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn or error")
 	)
 
 	flag.Parse()
+
+	logger, err := logging.New(os.Stderr, *logFormat, *logLevel)
+	if err != nil {
+		return err
+	}
+
+	// Set as the default too, so anything reaching for slog.Default lands in the
+	// same stream with the same format instead of writing unstructured lines.
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -58,11 +72,14 @@ func run() error {
 
 	defer meta.Close()
 
-	reg := registry.New(blobs, uploads, meta, registry.WithMaxBlobSize(*maxBlob))
+	reg := registry.New(blobs, uploads, meta,
+		registry.WithMaxBlobSize(*maxBlob),
+		registry.WithLogger(logger),
+	)
 
 	server := &http.Server{
 		Addr:    *addr,
-		Handler: ocihttp.NewHandler(reg),
+		Handler: ocihttp.WithLogging(ocihttp.NewHandler(reg), logger),
 		// A blob upload is a long request by nature, so there is no write or read
 		// deadline to cut it short. The header deadline still applies, which is
 		// what a slow-loris needs to be held open.
@@ -73,7 +90,7 @@ func run() error {
 	errs := make(chan error, 1)
 
 	go func() {
-		slog.Info("listening", "addr", *addr, "root", *root)
+		logger.Info("listening", "addr", *addr, "root", *root)
 
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errs <- fmt.Errorf("serve: %w", err)
@@ -90,7 +107,7 @@ func run() error {
 	case <-ctx.Done():
 	}
 
-	slog.Info("shutting down")
+	logger.Info("shutting down")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
