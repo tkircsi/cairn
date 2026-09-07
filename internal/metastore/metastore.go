@@ -2,7 +2,8 @@
 //
 // It holds no bytes. Its job is to answer the questions a content-addressed
 // store cannot: which repository may read a given blob, what a manifest claims
-// to be, and what state an in-progress upload is in.
+// to be, what name currently points at which manifest, and what state an
+// in-progress upload is in.
 package metastore
 
 import (
@@ -39,7 +40,35 @@ type Store interface {
 	// Manifest reports what a repository holds at a digest, including the media
 	// type a GET must answer with.
 	Manifest(ctx context.Context, repository string, dgst digest.Digest) (model.Manifest, error)
+	// DeleteManifest removes a manifest along with every tag in the repository
+	// pointing at it. The cascade is part of the contract, not an implementation
+	// detail: the spec requires a tag to stop resolving once its manifest is
+	// deleted, and an implementation that left the rows would advertise tags that
+	// cannot be fetched.
 	DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error
+
+	// PutTag points a tag at a manifest, creating it or moving it if it exists.
+	// Moving is expected traffic rather than a conflict, which is how a release
+	// name follows a new build.
+	PutTag(ctx context.Context, t model.Tag) error
+	Tag(ctx context.Context, repository, name string) (model.Tag, error)
+	// Tags lists tag names in ASCIIbetical order, beginning strictly after the
+	// cursor, which need not name a tag that exists.
+	//
+	// A negative limit means no limit; zero means no rows. Those are deliberately
+	// different, because the API distinguishes them: a request with no n asks for
+	// everything, and a request with n=0 asks for nothing and must not be quietly
+	// answered with everything.
+	Tags(ctx context.Context, repository, after string, limit int) ([]string, error)
+	DeleteTag(ctx context.Context, repository, name string) error
+
+	// RepositoryExists reports whether anything is filed under a name.
+	//
+	// Repositories are not created and there is no table of them; a repository is
+	// the scope a push names. But the spec still distinguishes an empty repository
+	// from one that does not exist, so the fact has to be derived from the other
+	// tables.
+	RepositoryExists(ctx context.Context, repository string) (bool, error)
 
 	CreateUpload(ctx context.Context, u model.Upload) error
 	Upload(ctx context.Context, id string) (model.Upload, error)

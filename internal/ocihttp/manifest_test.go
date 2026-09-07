@@ -550,27 +550,22 @@ func TestDeleteManifest(t *testing.T) {
 	}
 }
 
-// TestManifestTagIsRefusedNotFaked covers the scope boundary. A tag is well
-// formed and this registry simply does not serve it, so saying UNSUPPORTED is
-// honest where a 404 would invite the client to push over it.
-func TestManifestTagIsRefusedNotFaked(t *testing.T) {
+// TestUnknownTagIsNotFound covers the reference that is well formed and simply
+// does not name anything, which must be distinguishable from one that is
+// malformed.
+func TestUnknownTagIsNotFound(t *testing.T) {
 	server := newServer(t)
 
-	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete} {
-		resp := do(t, server, method, "/v2/"+repo+"/manifests/v1.0.0", nil, nil)
+	// Something has to be in the repository, or the answer would be about the
+	// repository rather than the tag.
+	raw, dgst := imageManifest(t, server, repo)
+	putManifest(t, server, repo, dgst, imageManifestType, raw)
 
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Errorf("%s status = %d, want 400", method, resp.StatusCode)
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodDelete} {
+		resp := do(t, server, method, "/v2/"+repo+"/manifests/nosuchtag", nil, nil)
 
-			continue
-		}
-
-		if method == http.MethodHead {
-			continue // no body to inspect
-		}
-
-		if code := errorCode(t, resp); code != "UNSUPPORTED" {
-			t.Errorf("%s code = %s, want UNSUPPORTED", method, code)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("%s status = %d, want 404", method, resp.StatusCode)
 		}
 	}
 }

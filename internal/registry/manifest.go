@@ -52,6 +52,9 @@ type manifestDoc struct {
 //
 // mediaType is the request's Content-Type, and is only used to catch a client
 // disagreeing with its own document; the value recorded comes from the bytes.
+//
+// expected may be empty, which is how a push by tag arrives: the client names the
+// manifest by a tag instead of a digest and so makes no claim about its content.
 func (r *Registry) PutManifest(
 	ctx context.Context,
 	repository string,
@@ -80,7 +83,11 @@ func (r *Registry) PutManifest(
 	// Derived from the bytes, then compared -- the same rule as a blob. A manifest
 	// is the document other content is trusted through, so accepting a claimed
 	// digest here would undermine every signature that points at it.
-	if actual := digest.FromBytes(raw); actual != expected {
+	//
+	// An empty expected means the client pushed by tag and made no claim. The
+	// digest is still computed from the bytes; there is simply nothing to disagree
+	// with, so there is nothing to reject.
+	if actual := digest.FromBytes(raw); expected != "" && actual != expected {
 		r.log.WarnContext(ctx, "manifest digest mismatch",
 			slog.String("repository", repository),
 			slog.String("claimed", expected.String()),

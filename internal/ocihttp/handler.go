@@ -10,17 +10,19 @@
 //	end-4b  POST   /v2/<name>/blobs/uploads/?digest=    single-request push
 //	end-5   PATCH  /v2/<name>/blobs/uploads/<ref>       one chunk
 //	end-6   PUT    /v2/<name>/blobs/uploads/<ref>?digest=
-//	end-7   PUT    /v2/<name>/manifests/<digest>
-//	end-9   DELETE /v2/<name>/manifests/<digest>
+//	end-7a  PUT    /v2/<name>/manifests/<reference>
+//	end-7b  PUT    /v2/<name>/manifests/<digest>?tag=&tag=
+//	end-8a  GET    /v2/<name>/tags/list
+//	end-8b  GET    /v2/<name>/tags/list?n=&last=
+//	end-9   DELETE /v2/<name>/manifests/<reference>
 //	end-10  DELETE /v2/<name>/blobs/<digest>
 //	end-11  POST   /v2/<name>/blobs/uploads/?mount=&from=
 //	end-13  GET    /v2/<name>/blobs/uploads/<ref>       session status
 //
-// References are digests only. A tag is recognised and refused rather than
-// treated as a missing manifest, so end-3 and end-7 are implemented for their
-// digest form alone.
+// A manifest reference is a digest or a tag. Blob references are always digests,
+// which is not an omission: a blob is opaque and has no name but its content.
 //
-// Manifest endpoints live in manifest.go.
+// Manifest endpoints live in manifest.go, tag listing in tags.go.
 //
 // The handler's whole job is translation: it parses a request into the arguments
 // the registry takes, and turns the registry's outcomes into the status and error
@@ -101,30 +103,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.blobs(w, r, name, tail)
 	case sectionManifests:
 		h.manifest(w, r, name, tail)
+	case sectionTags:
+		h.tags(w, r, name, tail)
 	}
 }
 
 // Route sections, which are the only path components after a repository name.
+var sections = []string{sectionBlobs, sectionManifests, sectionTags}
+
 const (
 	sectionBlobs     = "/blobs"
 	sectionManifests = "/manifests"
+	sectionTags      = "/tags"
 )
 
 // splitPath separates a repository name from the endpoint acting on it.
 //
 // A repository name contains slashes, so the route cannot simply be split on
-// them, and a name may legally end in a component called "blobs" or
-// "manifests". Taking the *last* occurrence of a section marker resolves that
-// ambiguity in favour of the endpoint, which is what other registries do; taking
-// the later of the two markers extends the same rule to a name containing both.
+// them, and a name may legally end in a component called "blobs", "manifests" or
+// "tags". Taking the *last* occurrence of any section marker resolves that
+// ambiguity in favour of the endpoint, which is what other registries do, and
+// taking the latest of the markers extends the rule to a name containing several.
 func splitPath(rest string) (name, section, tail string, ok bool) {
-	blobs := strings.LastIndex(rest, sectionBlobs)
-	manifests := strings.LastIndex(rest, sectionManifests)
+	marker, at := "", -1
 
-	marker, at := sectionBlobs, blobs
-
-	if manifests > blobs {
-		marker, at = sectionManifests, manifests
+	for _, candidate := range sections {
+		if found := strings.LastIndex(rest, candidate); found > at {
+			marker, at = candidate, found
+		}
 	}
 
 	if at < 0 {

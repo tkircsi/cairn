@@ -48,6 +48,9 @@ var (
 	// code: the manifest is the thing being rejected, but the *reason* is a
 	// missing child, and a client needs to know which.
 	ErrManifestBlobUnknown = errors.New("manifest references unknown content")
+	// ErrTagInvalid is a tag that does not match the spec's grammar, whether it
+	// arrived as a reference, a ?tag= parameter or a pagination cursor.
+	ErrTagInvalid = errors.New("tag invalid")
 )
 
 // DefaultMaxBlobSize caps a single blob.

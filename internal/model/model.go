@@ -26,9 +26,10 @@ type Blob struct {
 
 // Upload is an in-progress blob upload.
 //
-// This is the only mutable state in the store. Everything else is named by a
-// digest of its own content and so can never change; a session exists precisely
-// because the client is not required to know the digest until it closes.
+// One of the two kinds of mutable state here, the other being a Tag. Content is
+// named by the digest of its own bytes and so can never change; a session exists
+// precisely because the client is not required to know that digest until it
+// closes.
 type Upload struct {
 	// ID is opaque to clients and is the only part of a request that becomes a
 	// filesystem path, so it is generated here rather than accepted.
@@ -73,4 +74,27 @@ type Manifest struct {
 	Subject   digest.Digest
 	Size      int64
 	CreatedAt time.Time
+}
+
+// Tag is a human-chosen name for a manifest.
+//
+// The one piece of naming in the store that a person picks and that can be moved
+// later, which makes it the only place a client can ask for content without
+// already knowing its digest. That is the whole reason it exists: "give me
+// v1.2.3" is answerable, "give me sha256:47cf..." requires having been told.
+//
+// Being mutable is also why it is a row of its own rather than a column on
+// Manifest. A manifest is immutable and may carry many tags; a tag points at
+// exactly one manifest and is expected to be repointed at another.
+type Tag struct {
+	Repository string
+	// Name is the tag as written by the client, matched byte for byte. Two tags
+	// differing only in case are two tags, which is what the listing order the
+	// spec requires implies.
+	Name   string
+	Digest digest.Digest
+	// UpdatedAt is when the tag last moved, not when the manifest was pushed.
+	// Moving a tag is the only write in this store that destroys information, so
+	// it is the one worth timestamping.
+	UpdatedAt time.Time
 }

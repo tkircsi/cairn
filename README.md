@@ -5,13 +5,12 @@ to *find* them in SQL.
 
 The scope is deliberately one slice of the [OCI distribution
 spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md):
-blobs and manifests, addressed by digest. That slice exercises the whole shape of
-a registry — content addressing, upload sessions, repository scoping, and a
-manifest graph that has to resolve — without tags, listings or referrers on top.
+blobs, manifests and tags. That slice exercises the whole shape of a registry —
+content addressing, upload sessions, repository scoping, a manifest graph that has
+to resolve, and mutable names over immutable content — without referrers on top.
 
-**References are digests only.** A tag is recognised and refused rather than
-reported as a missing manifest, so `oras manifest push` works and `oras push`
-does not.
+Enough for `oras push`, `oras pull` and `oras repo tags` to work against it
+unmodified.
 
 ## Running it
 
@@ -73,12 +72,58 @@ a blob here is bytes plus a digest. The descriptor printed back on fetch says
 response. Media types are recorded by the *manifest* that references a blob, which
 is why the round trip cannot preserve one yet.
 
-## Manifests with oras
+## Tags: the normal oras workflow
 
-`oras push` is **not** usable here: it addresses its result by tag, and a client
-cannot know a manifest's digest before building it. `oras manifest push` takes a
-digest, so the artifact has to be assembled explicitly — which is arguably
-clearer about what a push actually is.
+With tags, `oras push` and `oras pull` work the way they do against any registry,
+because a tag is the only way to name content you have not built yet:
+
+```sh
+echo "hello from cairn" > note.txt
+oras push --plain-http 127.0.0.1:5050/acme/widgets:v1.0.0 note.txt:text/plain
+# Pushed [registry] 127.0.0.1:5050/acme/widgets:v1.0.0
+# Digest: sha256:2de88a7cb2d9c05fa78ff023ca4272632f44c79f4832a0b7995160a4bcb7531c
+
+oras repo tags --plain-http 127.0.0.1:5050/acme/widgets
+# v1.0.0
+
+oras pull --plain-http 127.0.0.1:5050/acme/widgets:v1.0.0
+```
+
+A release usually wants several names for one build, which is end-7b — one push,
+`tag` repeated, and the accepted names echoed back:
+
+```sh
+curl -si -X PUT -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+  --data-binary @manifest.json \
+  "http://127.0.0.1:5050/v2/acme/widgets/manifests/$MD?tag=1.2.3&tag=1.2&tag=latest"
+# HTTP/1.1 201 Created
+# Oci-Tag: 1.2.3, 1.2, latest
+```
+
+Listing is paginated by cursor, not by offset (end-8b). The `Link` header carries
+the next request, so a client never has to build one:
+
+```sh
+curl -s "http://127.0.0.1:5050/v2/acme/widgets/tags/list"
+# {"name":"acme/widgets","tags":["1.2","1.2.3","latest","v1.0.0"]}
+
+curl -si "http://127.0.0.1:5050/v2/acme/widgets/tags/list?n=2"
+# Link: </v2/acme/widgets/tags/list?last=1.2.3&n=2>; rel="next"
+# {"name":"acme/widgets","tags":["1.2","1.2.3"]}
+
+curl -s "http://127.0.0.1:5050/v2/acme/widgets/tags/list?last=1.2.3&n=2"
+# {"name":"acme/widgets","tags":["latest","v1.0.0"]}
+```
+
+Note the order: `1.2` before `1.2.3`, and `latest` before `v1.0.0`. That is
+ASCIIbetical, which the spec names by pointing at Go's `sort.Strings`, and it is
+not version order — `v10` sorts before `v9`.
+
+## Manifests by digest with oras
+
+`oras manifest push` addresses a manifest by its own digest, which means
+assembling the artifact explicitly. Nothing requires this now that tags exist, but
+it is the clearest view of what a push actually is.
 
 Blobs first, because a manifest that names absent content is refused:
 
@@ -160,13 +205,16 @@ leaves the other untouched.
 |--------|--------|------|
 | end-1  | GET    | `/v2/` |
 | end-2  | GET, HEAD | `/v2/<name>/blobs/<digest>` (supports `Range`) |
-| end-3  | GET, HEAD | `/v2/<name>/manifests/<digest>` |
+| end-3  | GET, HEAD | `/v2/<name>/manifests/<digest\|tag>` |
 | end-4a | POST   | `/v2/<name>/blobs/uploads/` |
 | end-4b | POST   | `/v2/<name>/blobs/uploads/?digest=<digest>` |
 | end-5  | PATCH  | `/v2/<name>/blobs/uploads/<ref>` |
 | end-6  | PUT    | `/v2/<name>/blobs/uploads/<ref>?digest=<digest>` |
-| end-7  | PUT    | `/v2/<name>/manifests/<digest>` |
-| end-9  | DELETE | `/v2/<name>/manifests/<digest>` |
+| end-7a | PUT    | `/v2/<name>/manifests/<digest\|tag>` |
+| end-7b | PUT    | `/v2/<name>/manifests/<digest>?tag=&tag=` |
+| end-8a | GET    | `/v2/<name>/tags/list` |
+| end-8b | GET    | `/v2/<name>/tags/list?n=&last=` |
+| end-9  | DELETE | `/v2/<name>/manifests/<digest\|tag>` |
 | end-10 | DELETE | `/v2/<name>/blobs/<digest>` |
 | end-11 | POST   | `/v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>` |
 | end-13 | GET    | `/v2/<name>/blobs/uploads/<ref>` |
@@ -213,6 +261,13 @@ column so a HEAD touches only the index. And **what refers to this?** — the
 the parent, which is a scan without an index and a seek with one. That second
 question is where SQL stops being a convenience, and it is the one still
 unanswered here: the column is populated, the endpoint is not written.
+
+Tags add the question that runs the other way. Content names itself, but nobody
+wants to type a digest, so **what does this name point at right now?** needs a
+place to live — and unlike everything else here, the answer changes. The `tags`
+table is the only mutable naming in the store, and it is clustered on
+`(repository, name)` precisely because that is the order end-8a must return, which
+turns listing into an ordered range scan and pagination into a seek.
 
 ## Decisions worth knowing
 
@@ -323,10 +378,33 @@ received, never re-serialised. Canonicalising the JSON would change the digest a
 invalidate every signature over it. This is also why parsing does not reject
 unknown fields: annotations and later spec additions must survive the round trip.
 
-**A tag is refused, not faked.** `UNSUPPORTED` on a well-formed tag, rather than
-`MANIFEST_UNKNOWN`. A 404 would be a lie a client acts on — it would conclude the
-manifest is absent and try to push one. An unsupported digest *algorithm* is
-distinguished from a malformed reference for the same reason.
+**A tag resolves to a digest and then behaves identically.** A GET by tag returns
+the same body and the same `Docker-Content-Digest` as a GET by the digest behind
+it. The tag is an indirection in the lookup, not a different kind of response, so
+nothing downstream needs to know which form the client used.
+
+**Deleting a tag and deleting a manifest are different operations at one URL.**
+end-9 on a tag withdraws a name and leaves the content; end-9 on a digest removes
+the content and takes every name for it along too. The cascade is the spec's
+requirement — a tag must stop resolving once its manifest is gone — and it is the
+only transaction in the store, because a listing that advertised a tag which
+cannot be fetched would be worse than one that omitted it.
+
+**Pagination is by cursor, never by offset.** `last` names a position in the
+ordering rather than a count into it, so a tag pushed or deleted mid-walk cannot
+shift the window and make a client skip or repeat one. The cursor need not still
+exist, which is exactly the case that makes offsets wrong.
+
+**A repository exists if anything is filed under it.** There is no repositories
+table and no create step; existence is derived from the other tables. But the
+distinction is still worth deriving, because the spec requires a pull of a
+nonexistent repository to 404, and a typo would otherwise be indistinguishable
+from a repository that simply has no tags yet. The check runs only when a page
+comes back empty, so a repository with tags pays nothing for it.
+
+**An unsupported digest algorithm is distinguished from a malformed reference.**
+`UNSUPPORTED` rather than `MANIFEST_INVALID`, because "I do not implement md5" and
+"that is not a reference" call for different responses from the client.
 
 ## Logging
 
@@ -363,9 +441,10 @@ Nothing emits at debug yet, so `-log-level debug` only widens the filter.
 
 ## Known gaps
 
-- No tags, so no end-8 tag listing and no way to name a manifest by anything but
-  its digest. This is what stops `oras push`, `docker pull` and most of the
-  ecosystem from working end to end.
+- end-8a returns every tag in a repository, with no ceiling. A client that sends
+  `n` gets a bounded page and a `Link`; one that does not gets the whole list,
+  which for a repository with a very large number of tags is a response nobody
+  wants. A default page size would fix it and is deliberately not invented here.
 - No referrers (end-12). The `subject` and `artifact_type` columns are populated
   on every push, so the endpoint is a query away, but the index it wants is
   deliberately absent until then — an unused index is only write amplification.
