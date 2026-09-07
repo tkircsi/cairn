@@ -1,3 +1,5 @@
 /data/
 /.gocache/
 /cairnd
+.conformance/
+conformance-report/

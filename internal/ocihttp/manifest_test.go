@@ -570,31 +570,92 @@ func TestUnknownTagIsNotFound(t *testing.T) {
 	}
 }
 
-func TestManifestRejectedReferences(t *testing.T) {
+// TestManifestUnusableReferenceOnRead covers a reference that is neither a digest
+// nor a legal tag, which is to say one that names nothing that could exist.
+//
+// A read answers 404, not 400. Calling the reference malformed is the tempting
+// reading and the conformance suite is explicit that it is wrong: it requests
+// ".INVALID_MANIFEST_NAME" under the name "nonexistent manifest" and requires 404.
+// The client's position is identical either way -- there is no manifest here -- and
+// a 400 would invite a retry of a request that cannot succeed.
+func TestManifestUnusableReferenceOnRead(t *testing.T) {
 	server := newServer(t)
 
-	cases := []struct {
-		name      string
-		reference string
-		code      string
-	}{
-		{"not a digest or a tag", "sha256:short", "MANIFEST_INVALID"},
-		{"unknown algorithm", "md5:d41d8cd98f00b204e9800998ecf8427e", "UNSUPPORTED"},
-		{"empty-ish", ".", "MANIFEST_INVALID"},
+	references := []string{
+		// The suite's own value, and the case that failed conformance.
+		".INVALID_MANIFEST_NAME",
+		// A digest-shaped string with the wrong length: recognisably an attempt at a
+		// digest, still not one.
+		"sha256:short",
+		".",
+		"tag with spaces",
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			resp := do(t, server, http.MethodGet, "/v2/"+repo+"/manifests/"+tc.reference, nil, nil)
+	for _, reference := range references {
+		t.Run(reference, func(t *testing.T) {
+			for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodDelete} {
+				resp := do(t, server, method, "/v2/"+repo+"/manifests/"+reference, nil, nil)
 
-			if resp.StatusCode != http.StatusBadRequest {
-				t.Fatalf("status = %d, want 400", resp.StatusCode)
-			}
+				if resp.StatusCode != http.StatusNotFound {
+					t.Errorf("%s status = %d, want 404", method, resp.StatusCode)
 
-			if code := errorCode(t, resp); code != tc.code {
-				t.Errorf("code = %s, want %s", code, tc.code)
+					continue
+				}
+
+				// HEAD has no body to carry an envelope.
+				if method == http.MethodHead {
+					continue
+				}
+
+				if code := errorCode(t, resp); code != "MANIFEST_UNKNOWN" {
+					t.Errorf("%s code = %s, want MANIFEST_UNKNOWN", method, code)
+				}
 			}
 		})
+	}
+}
+
+// TestManifestUnusableReferenceOnWrite is the other half of the rule. A PUT is not
+// asking whether a name resolves; it is asking for the name to be assigned, and
+// this one is not a name a tag may have -- so 404 would be nonsense and 400 is the
+// answer.
+func TestManifestUnusableReferenceOnWrite(t *testing.T) {
+	server := newServer(t)
+
+	raw, _ := imageManifest(t, server, repo)
+
+	resp := do(t, server, http.MethodPut,
+		"/v2/"+repo+"/manifests/.INVALID_MANIFEST_NAME",
+		bytes.NewReader(raw),
+		map[string]string{"Content-Type": imageManifestType},
+	)
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+
+	if code := errorCode(t, resp); code != "MANIFEST_INVALID" {
+		t.Errorf("code = %s, want MANIFEST_INVALID", code)
+	}
+}
+
+// TestManifestUnsupportedAlgorithm stays a 400, and is the one reference shape not
+// folded into the 404 above. "I do not implement md5" is a different statement from
+// "there is nothing here": the reference is well formed, so a client learns
+// something actionable from being told the algorithm is the problem, and go-digest
+// distinguishes the two cases for free.
+func TestManifestUnsupportedAlgorithm(t *testing.T) {
+	server := newServer(t)
+
+	resp := do(t, server, http.MethodGet,
+		"/v2/"+repo+"/manifests/md5:d41d8cd98f00b204e9800998ecf8427e", nil, nil)
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+
+	if code := errorCode(t, resp); code != "UNSUPPORTED" {
+		t.Errorf("code = %s, want UNSUPPORTED", code)
 	}
 }
 

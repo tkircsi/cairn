@@ -42,9 +42,25 @@ func (h *Handler) manifest(w http.ResponseWriter, r *http.Request, name, referen
 	case errors.Is(err, digest.ErrDigestUnsupported):
 		writeError(w, http.StatusBadRequest, "UNSUPPORTED", "unsupported digest algorithm")
 
-	default:
+	// A reference that is neither a digest nor a legal tag names nothing that could
+	// exist, and what that means depends on the method rather than on the string.
+	//
+	// A read is answered 404. It is tempting to call the reference malformed and
+	// refuse it, and the conformance suite is explicit that this is wrong: it asks
+	// for ".INVALID_MANIFEST_NAME" under the name "nonexistent manifest" and
+	// requires 404. The client's position is the same either way -- there is no
+	// manifest here -- and a 400 would invite a retry of a request that cannot
+	// succeed.
+	//
+	// A write is refused, because a PUT is not asking whether the name resolves; it
+	// is asking for the name to be assigned, and this one is not a name a tag may
+	// have.
+	case r.Method == http.MethodPut:
 		writeError(w, http.StatusBadRequest, "MANIFEST_INVALID",
 			"reference is neither a digest nor a valid tag")
+
+	default:
+		writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "manifest unknown")
 	}
 }
 

@@ -583,9 +583,22 @@ nonexistent repository to 404, and a typo would otherwise be indistinguishable
 from a repository that simply has no tags yet. The check runs only when a page
 comes back empty, so a repository with tags pays nothing for it.
 
-**An unsupported digest algorithm is distinguished from a malformed reference.**
-`UNSUPPORTED` rather than `MANIFEST_INVALID`, because "I do not implement md5" and
-"that is not a reference" call for different responses from the client.
+**A reference that could not exist is a 404 on read and a 400 on write.** A string
+that is neither a digest nor a legal tag names nothing, and what that means depends
+on the method. A GET, HEAD or DELETE is answered `MANIFEST_UNKNOWN`: the client's
+position is the same as for any missing manifest, and a 400 would invite a retry of
+a request that cannot succeed. A PUT is refused, because it is not asking whether
+the name resolves but for the name to be assigned, and that is not a name a tag may
+have.
+
+Calling it malformed on read was the original behaviour and it failed conformance —
+the suite requests `.INVALID_MANIFEST_NAME` under the name "nonexistent manifest".
+
+**An unsupported digest algorithm is the one exception, and stays a 400.**
+`UNSUPPORTED` rather than a 404, because "I do not implement md5" is a different
+statement from "there is nothing here": the reference is well formed, so naming the
+algorithm as the problem tells the client something it can act on, and `go-digest`
+separates the two cases for free.
 
 ## Logging
 
@@ -651,6 +664,44 @@ Nothing emits at debug yet, so `-log-level debug` only widens the filter.
 - No request ID, so an access record and the domain records emitted while serving
   it share only a digest or upload ID. Fine at one request at a time, thin under
   concurrency. Logs go to stderr and are not rotated.
+
+## Conformance
+
+The OCI project maintains a conformance suite, which is the only answer to "is this
+compliant" that is not an opinion:
+
+```sh
+./scripts/conformance.sh
+# Ran 75 of 79 Specs in 0.164 seconds
+# SUCCESS! -- 75 Passed | 0 Failed | 0 Pending | 4 Skipped
+```
+
+It clones a pinned `distribution-spec` tag, builds the suite's binary, starts a
+`cairnd` on a temporary root, runs all four workflows — pull, push, content
+discovery, content management — and deletes everything after. Point it at nothing
+you care about: the suite pushes and deletes real content.
+
+The version is pinned because a passing run against `main` would only mean
+"compliant with whatever the spec said today", which is not a claim anyone can check
+afterwards.
+
+The four skips are configuration alternatives rather than gaps. Two are the
+mutually exclusive halves of the automatic cross-mount question, and cairn declares
+its side with `OCI_AUTOMATIC_CROSSMOUNT=1` — end-11 without `from` resolves the
+blob itself and returns 201. The other two are opt-outs from the suite's own setup
+(`OCI_TAG_NAME`, `OCI_TAG_LIST`) that only apply when pointing it at content that
+already exists.
+
+Worth knowing what a pass does and does not cover. The suite exercises referrers,
+including a subject with none and the `artifactType` filter, so end-12 is checked
+rather than merely written. It does not check `_catalog`, which is not in the OCI
+spec at all, and it says nothing about the decisions above where the spec permits a
+choice.
+
+Running it found one real bug, which is the argument for running it at all: a
+reference that is neither a digest nor a legal tag was answered 400, and the suite
+requires 404 — it asks for `.INVALID_MANIFEST_NAME` under the name "nonexistent
+manifest".
 
 ## Tests
 
