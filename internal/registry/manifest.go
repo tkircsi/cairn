@@ -39,6 +39,31 @@ type manifestDoc struct {
 	Layers       []ocispec.Descriptor `json:"layers"`
 	Manifests    []ocispec.Descriptor `json:"manifests"`
 	Subject      *ocispec.Descriptor  `json:"subject"`
+	Annotations  map[string]string    `json:"annotations"`
+}
+
+// effectiveArtifactType resolves what a referrers response must report as this
+// manifest's artifactType.
+//
+// The spec's rule is not "whatever the field said". An image manifest that omits
+// artifactType is described by its config's media type instead, which is how the
+// convention that predates the field -- putting the artifact's type in the config
+// descriptor -- keeps working. An index that omits it has nothing to fall back to,
+// since an index has no config, so the field is omitted entirely.
+//
+// Presence of config is what distinguishes the two, matching how the rest of this
+// file decides which document arrived: the shape says what it is, mediaType only
+// claims it.
+func (d manifestDoc) effectiveArtifactType() string {
+	if d.ArtifactType != "" {
+		return d.ArtifactType
+	}
+
+	if d.Config != nil {
+		return d.Config.MediaType
+	}
+
+	return ""
 }
 
 // PutManifest verifies a manifest and records it.
@@ -119,10 +144,13 @@ func (r *Registry) PutManifest(
 	}
 
 	manifest := model.Manifest{
-		Repository:   repository,
-		Digest:       dgst,
-		MediaType:    doc.MediaType,
-		ArtifactType: doc.ArtifactType,
+		Repository: repository,
+		Digest:     dgst,
+		MediaType:  doc.MediaType,
+		// Resolved here rather than when a referrers query runs, so the fallback rule
+		// is applied once per push instead of once per row per listing.
+		ArtifactType: doc.effectiveArtifactType(),
+		Annotations:  doc.Annotations,
 		CreatedAt:    r.now(),
 		Size:         size,
 	}
@@ -227,10 +255,22 @@ func declaredMediaType(header string) (string, error) {
 // field the descriptor came from rather than by its mediaType -- a client is free
 // to be wrong about a media type, but not about where it put the content.
 //
-// The subject is exempt, and that exemption is the spec's: a signature or SBOM
-// may be pushed before, or entirely without, the thing it describes. Requiring
-// it would break the ordering real signing tools use.
+// The subject is exempt from having to exist, and that exemption is the spec's: a
+// signature or SBOM may be pushed before, or entirely without, the thing it
+// describes. Requiring it would break the ordering real signing tools use. It
+// still has to be a digest, because it becomes the key a referrers query looks up.
 func (r *Registry) checkReferences(ctx context.Context, repository string, doc manifestDoc) error {
+	// Checked for syntax only. An unparseable subject would be stored as a key no
+	// query could ever produce, so the manifest would be silently unfindable by the
+	// one endpoint that exists to find it -- refusing it now is the difference
+	// between a client error and a referrer that vanishes.
+	if doc.Subject != nil {
+		if err := doc.Subject.Digest.Validate(); err != nil {
+			return fmt.Errorf("%w: subject has an invalid digest %q: %v",
+				ErrManifestInvalid, doc.Subject.Digest, err)
+		}
+	}
+
 	if doc.Config != nil && doc.Config.Digest != "" {
 		if err := r.requireBlob(ctx, repository, doc.Config.Digest, "config"); err != nil {
 			return err

@@ -7,6 +7,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -40,6 +41,11 @@ CREATE TABLE IF NOT EXISTS manifests (
     -- Go zero value round-trips. digest.Digest("") is already the natural "none".
     artifact_type TEXT    NOT NULL DEFAULT '',
     subject       TEXT    NOT NULL DEFAULT '',
+    -- The manifest's annotations as a JSON object, or '' for none. Stored rather
+    -- than read back out of the bytes because a referrers response must reproduce
+    -- them, and re-reading every candidate manifest to answer one query is the
+    -- O(N) behaviour this schema exists to avoid.
+    annotations   TEXT    NOT NULL DEFAULT '',
     size          INTEGER NOT NULL,
     created_at    TEXT    NOT NULL,
     PRIMARY KEY (repository, digest)
@@ -51,12 +57,22 @@ CREATE TABLE IF NOT EXISTS manifests (
 -- degrades into a full scan of the table per file it considers.
 CREATE INDEX IF NOT EXISTS manifests_by_digest ON manifests (digest);
 
--- No index on subject yet, deliberately. It would serve only the referrers
--- endpoint, which does not exist, and until then it is write amplification on
--- every push. The asymmetry that decides this: CREATE INDEX IF NOT EXISTS is
--- free to add later because this schema is reapplied on open, whereas adding a
--- *column* later would need an ALTER and a backfill that nothing here performs.
--- So the columns land now and the index waits.
+-- The index the referrers endpoint runs on, and the reason SQL is here at all.
+-- The pointer is stored on the child but every client asks from the parent --
+-- "what refers to this?" -- which is a table scan without this and a seek with it.
+--
+-- Partial, because most manifests are not referrers. Restricting it to rows that
+-- have a subject keeps it proportional to the number of signatures and SBOMs
+-- rather than to everything ever pushed, and keeps a plain image push from paying
+-- to maintain an entry it would never appear in.
+-- created_at and digest are in the key, after the two columns the query fixes,
+-- because they are what it orders by. Without them the seek is followed by a sort
+-- of everything it found; with them the index is already in the requested order and
+-- is simply walked backwards. Both directions are DESC in the query for exactly this
+-- reason -- a mixed ORDER BY cannot be satisfied by one traversal of one index.
+CREATE INDEX IF NOT EXISTS manifests_by_subject
+    ON manifests (repository, subject, created_at, digest)
+    WHERE subject != '';
 
 CREATE TABLE IF NOT EXISTS tags (
     repository TEXT NOT NULL,
@@ -94,6 +110,32 @@ CREATE TABLE IF NOT EXISTS uploads (
 CREATE INDEX IF NOT EXISTS uploads_by_updated_at ON uploads (updated_at);
 `
 
+// migrations bring a database created by an older build up to the schema above.
+//
+// CREATE TABLE IF NOT EXISTS silently does nothing when the table is already
+// there, so a column added to it after the fact never reaches a database that
+// already exists. Indexes need no entry here -- CREATE INDEX IF NOT EXISTS
+// applies on every open -- and neither do new tables. Only columns.
+//
+// Every string is a literal, with no interpolation and no user input anywhere
+// near it, which is what makes DDL that cannot be parameterized safe to run.
+var migrations = []struct {
+	// name identifies the migration in an error, not in the database. There is no
+	// version table: each check asks the schema itself whether it has already been
+	// applied, which cannot drift out of step with reality the way a recorded
+	// version number can.
+	name string
+	// check counts matching columns; a non-zero result means already applied.
+	check string
+	apply string
+}{
+	{
+		name:  "manifests.annotations",
+		check: `SELECT COUNT(*) FROM pragma_table_info('manifests') WHERE name = 'annotations'`,
+		apply: `ALTER TABLE manifests ADD COLUMN annotations TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
 // Store is a SQLite-backed metastore.
 type Store struct {
 	db *sql.DB
@@ -110,6 +152,10 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA busy_timeout = 5000",
 		"PRAGMA foreign_keys = ON",
+		// Bounds how much of an index ANALYZE will read, so gathering statistics stays
+		// proportional to nothing in particular rather than to the size of the database.
+		// SQLite's own recommended value.
+		"PRAGMA analysis_limit = 400",
 	} {
 		if _, err := db.ExecContext(ctx, pragma); err != nil {
 			db.Close()
@@ -124,10 +170,85 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	if err := migrate(ctx, db); err != nil {
+		db.Close()
+
+		return nil, err
+	}
+
+	store := &Store{db: db}
+
+	// Statistics are not a tuning nicety here; without them the referrers query gets
+	// the wrong plan. SQLite's planner will only prefer manifests_by_subject to a
+	// prefix seek of the primary key once it knows how selective the subject column
+	// is, and with no sqlite_stat1 it guesses -- landing on a plan that reads every
+	// manifest in the repository. The index exists and is simply not chosen.
+	//
+	// So this runs on open as well as close. On close it records the shape of the
+	// database that was just written; on open it is what makes a database that has
+	// never been closed cleanly, or was created by an older build, usable now.
+	if err := store.Optimize(ctx); err != nil {
+		db.Close()
+
+		return nil, err
+	}
+
+	return store, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+// Optimize refreshes the query planner's statistics.
+//
+// PRAGMA optimize is a no-op unless something has changed enough to be worth
+// re-analysing, which is what makes it safe to call on every open and close rather
+// than needing a schedule.
+//
+// It is exported because the schedule is the caller's problem and cannot be solved
+// here. Statistics are only as current as the last call, so a long-running daemon
+// that opens an empty database and then serves a million pushes will hold the
+// statistics of an empty database for the whole run -- the plan degrades quietly as
+// the data it was chosen for stops resembling the data it runs against.
+func (s *Store) Optimize(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		return fmt.Errorf("optimize: %w", err)
+	}
+
+	return nil
+}
+
+// migrate applies any column additions the database is missing.
+//
+// Each is guarded by asking the schema rather than by tracking a version, so
+// running this against a fresh database -- where the CREATE TABLE above already
+// included the column -- is a no-op rather than an error.
+func migrate(ctx context.Context, db *sql.DB) error {
+	for _, m := range migrations {
+		var present int
+		if err := db.QueryRowContext(ctx, m.check).Scan(&present); err != nil {
+			return fmt.Errorf("check migration %s: %w", m.name, err)
+		}
+
+		if present > 0 {
+			continue
+		}
+
+		if _, err := db.ExecContext(ctx, m.apply); err != nil {
+			return fmt.Errorf("apply migration %s: %w", m.name, err)
+		}
+	}
+
+	return nil
+}
+
+// Close records what the planner learned during this run and then closes.
+//
+// A failed optimize is not worth failing a shutdown over -- the database is intact
+// either way and the next open will try again -- but it must not skip the close, so
+// the error is dropped rather than returned.
+func (s *Store) Close() error {
+	_ = s.Optimize(context.Background())
+
+	return s.db.Close()
+}
 
 func (s *Store) PutBlob(ctx context.Context, b model.Blob) error {
 	const query = `
@@ -177,13 +298,20 @@ func (s *Store) DeleteBlob(ctx context.Context, repository string, dgst digest.D
 
 func (s *Store) PutManifest(ctx context.Context, m model.Manifest) error {
 	const query = `
-INSERT INTO manifests (repository, digest, media_type, artifact_type, subject, size, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO manifests (
+    repository, digest, media_type, artifact_type, subject, annotations, size, created_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (repository, digest) DO NOTHING`
 
-	_, err := s.db.ExecContext(ctx, query,
+	annotations, err := encodeAnnotations(m.Annotations)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.ExecContext(ctx, query,
 		m.Repository, m.Digest.String(), m.MediaType, m.ArtifactType,
-		m.Subject.String(), m.Size, formatTime(m.CreatedAt),
+		m.Subject.String(), annotations, m.Size, formatTime(m.CreatedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert manifest: %w", err)
@@ -198,31 +326,134 @@ func (s *Store) Manifest(
 	dgst digest.Digest,
 ) (model.Manifest, error) {
 	const query = `
-SELECT repository, digest, media_type, artifact_type, subject, size, created_at
+SELECT repository, digest, media_type, artifact_type, subject, annotations, size, created_at
 FROM manifests
 WHERE repository = ? AND digest = ?`
 
-	var (
-		m         model.Manifest
-		dgstText  string
-		subject   string
-		createdAt string
-	)
-
-	err := s.db.QueryRowContext(ctx, query, repository, dgst.String()).Scan(
-		&m.Repository, &dgstText, &m.MediaType, &m.ArtifactType,
-		&subject, &m.Size, &createdAt,
-	)
+	m, err := scanManifest(s.db.QueryRowContext(ctx, query, repository, dgst.String()))
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Manifest{}, metastore.ErrNotFound
 	}
 
 	if err != nil {
+		return model.Manifest{}, err
+	}
+
+	return m, nil
+}
+
+// referrersQuery is the statement Referrers runs.
+//
+// A package-level constant rather than a local one so that a test can put it
+// through EXPLAIN QUERY PLAN. The index it depends on is chosen conditionally by
+// the planner, which makes "does this use the index" a real question with a
+// checkable answer -- and one that would otherwise regress into a table scan
+// without anything failing.
+//
+// One statement with an artifact_type predicate that is a tautology when no filter
+// was asked for, rather than two statements assembled by string concatenation. The
+// empty string is not a legal artifact type, so it is unambiguous as "no filter".
+//
+// Ordering by created_at is not required by the spec, which says nothing about
+// order. It is here so the response is stable across calls -- an unordered SQL
+// result is entitled to differ between identical queries -- and digest breaks ties,
+// since two referrers pushed in the same clock tick would otherwise still be
+// unordered.
+//
+// Both keys descend, which looks like an odd way to break a tie and is deliberate.
+// One traversal of one index can satisfy only an ORDER BY whose directions agree, so
+// "created_at DESC, digest ASC" would be a seek followed by a sort of the result.
+// Nothing depends on which referrer wins a tie, only that the same one always does.
+//
+// The subject != ” term is doing two jobs and neither is redundant.
+//
+// It excludes manifests that are not referrers at all: those are stored with an
+// empty subject, so a caller passing an empty digest would otherwise be handed
+// every plain manifest in the repository as though each referred to nothing.
+//
+// It is also what makes manifests_by_subject usable. SQLite chooses a partial index
+// only when the query's WHERE clause implies the index's own predicate, and
+// "subject = ?" against a bound parameter does not -- the planner cannot know the
+// parameter is non-empty. Stating it turns a scan into a seek.
+const referrersQuery = `
+SELECT repository, digest, media_type, artifact_type, subject, annotations, size, created_at
+FROM manifests
+WHERE repository = ?
+  AND subject = ?
+  AND subject != ''
+  AND (? = '' OR artifact_type = ?)
+ORDER BY created_at DESC, digest DESC`
+
+// Referrers lists the manifests in a repository whose subject is dgst, newest
+// first, optionally restricted to one artifact type.
+//
+// The subject is not required to exist. A signature is often pushed before the
+// thing it signs finishes uploading, and a referrer whose subject was later
+// deleted is still a fact the registry holds; refusing to list either would make
+// the endpoint's answer depend on something it is not being asked about.
+func (s *Store) Referrers(
+	ctx context.Context,
+	repository string,
+	subject digest.Digest,
+	artifactType string,
+) ([]model.Manifest, error) {
+	rows, err := s.db.QueryContext(ctx, referrersQuery,
+		repository, subject.String(), artifactType, artifactType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query referrers: %w", err)
+	}
+	defer rows.Close()
+
+	var referrers []model.Manifest
+
+	for rows.Next() {
+		m, err := scanManifest(rows)
+		if err != nil {
+			return nil, err
+		}
+
+		referrers = append(referrers, m)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate referrers: %w", err)
+	}
+
+	return referrers, nil
+}
+
+// scanManifest reads one manifest row. Taking the narrowest interface both
+// *sql.Row and *sql.Rows satisfy keeps the single-row and multi-row paths on one
+// column order, which is the thing that silently breaks when they drift.
+func scanManifest(row interface{ Scan(...any) error }) (model.Manifest, error) {
+	var (
+		m           model.Manifest
+		dgstText    string
+		subject     string
+		annotations string
+		createdAt   string
+	)
+
+	err := row.Scan(
+		&m.Repository, &dgstText, &m.MediaType, &m.ArtifactType,
+		&subject, &annotations, &m.Size, &createdAt,
+	)
+	if err != nil {
+		// Passed through unwrapped so callers can still test for sql.ErrNoRows.
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Manifest{}, err
+		}
+
 		return model.Manifest{}, fmt.Errorf("scan manifest: %w", err)
 	}
 
 	m.Digest = digest.Digest(dgstText)
 	m.Subject = digest.Digest(subject)
+
+	if m.Annotations, err = decodeAnnotations(annotations); err != nil {
+		return model.Manifest{}, err
+	}
 
 	if m.CreatedAt, err = parseTime(createdAt); err != nil {
 		return model.Manifest{}, err
@@ -572,6 +803,40 @@ func scanBlob(row *sql.Row) (model.Blob, error) {
 	}
 
 	return b, nil
+}
+
+// Annotations are stored as a JSON object, which is how they arrived and how they
+// leave. Normalising them into a key-value table would let them be queried, but
+// nothing queries them: the only reader is a referrers response that reproduces
+// the map whole.
+//
+// The empty string, not "{}", stands for none. It keeps a manifest with no
+// annotations from paying two bytes per row, and makes the column's zero value and
+// Go's nil map the same thing.
+func encodeAnnotations(a map[string]string) (string, error) {
+	if len(a) == 0 {
+		return "", nil
+	}
+
+	encoded, err := json.Marshal(a)
+	if err != nil {
+		return "", fmt.Errorf("encode annotations: %w", err)
+	}
+
+	return string(encoded), nil
+}
+
+func decodeAnnotations(s string) (map[string]string, error) {
+	if s == "" {
+		return nil, nil
+	}
+
+	var a map[string]string
+	if err := json.Unmarshal([]byte(s), &a); err != nil {
+		return nil, fmt.Errorf("decode annotations: %w", err)
+	}
+
+	return a, nil
 }
 
 // Times are stored as UTC RFC3339 text: it sorts lexically in the same order it

@@ -5,12 +5,13 @@ to *find* them in SQL.
 
 The scope is deliberately one slice of the [OCI distribution
 spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md):
-blobs, manifests and tags. That slice exercises the whole shape of a registry —
-content addressing, upload sessions, repository scoping, a manifest graph that has
-to resolve, and mutable names over immutable content — without referrers on top.
+blobs, manifests, tags and referrers. That slice exercises the whole shape of a
+registry — content addressing, upload sessions, repository scoping, a manifest
+graph that has to resolve, mutable names over immutable content, and the one query
+content addressing cannot answer on its own.
 
-Enough for `oras push`, `oras pull` and `oras repo tags` to work against it
-unmodified.
+Enough for `oras push`, `oras pull`, `oras repo tags`, `oras attach` and
+`oras discover` to work against it unmodified.
 
 ## Running it
 
@@ -119,6 +120,86 @@ Note the order: `1.2` before `1.2.3`, and `latest` before `v1.0.0`. That is
 ASCIIbetical, which the spec names by pointing at Go's `sort.Strings`, and it is
 not version order — `v10` sorts before `v9`.
 
+## Referrers: attaching things to a manifest
+
+`oras attach` pushes a manifest whose `subject` names another, and `oras discover`
+asks the question back:
+
+```sh
+echo '{"packages":["libfoo 1.2.3"]}' > sbom.json
+echo '{"sig":"pretend"}' > sig.json
+
+oras attach --plain-http --artifact-type application/vnd.example.sbom.v1+json \
+  --annotation "org.example.tool=syft" 127.0.0.1:5050/acme/widgets:v1 sbom.json
+
+oras attach --plain-http --artifact-type application/vnd.example.signature.v1+json \
+  --annotation "org.example.signer=alice" 127.0.0.1:5050/acme/widgets:v1 sig.json
+
+oras discover --plain-http 127.0.0.1:5050/acme/widgets:v1
+# 127.0.0.1:5050/acme/widgets@sha256:681acb09…
+# ├── application/vnd.example.signature.v1+json
+# │   └── sha256:3884342d…
+# │       └── [annotations]
+# │           ├── org.example.signer: alice
+# │           └── org.opencontainers.image.created: "2026-09-07T08:25:58Z"
+# └── application/vnd.example.sbom.v1+json
+#     └── sha256:ee37d3ea…
+#         └── [annotations]
+#             └── org.example.tool: syft
+
+oras discover --plain-http \
+  --artifact-type application/vnd.example.sbom.v1+json 127.0.0.1:5050/acme/widgets:v1
+```
+
+`oras attach` resolves the tag to a digest before pushing and then reports the
+digest, not the tag — which is the point. The pointer a referrer stores is the
+digest, so the association survives the tag moving to a different build.
+
+The raw form (end-12a) returns an image index that was never pushed and has no
+stable digest of its own, since the next signature changes it:
+
+```sh
+curl -s "http://127.0.0.1:5050/v2/acme/widgets/referrers/$SUBJECT"
+```
+
+```json
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "manifests": [
+    {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:3884342d…",
+      "size": 785,
+      "annotations": { "org.example.signer": "alice" },
+      "artifactType": "application/vnd.example.signature.v1+json"
+    }
+  ]
+}
+```
+
+Every field in a descriptor there comes from a column. Nothing in the loop opens a
+manifest, which is the difference the `manifests` table buys: the alternative is
+reading and parsing every candidate manifest to answer one query.
+
+Filtering declares itself, so a client can tell a narrowed list from a registry
+that ignored the parameter (end-12b):
+
+```sh
+curl -si "http://127.0.0.1:5050/v2/acme/widgets/referrers/$SUBJECT?artifactType=application/vnd.example.sbom.v1+json"
+# HTTP/1.1 200 OK
+# Content-Type: application/vnd.oci.image.index.v1+json
+# Oci-Filters-Applied: artifactType
+```
+
+A subject nothing refers to is an empty list and a 200, not a 404 — "nothing has
+been said about this" is an answer:
+
+```sh
+curl -s "http://127.0.0.1:5050/v2/acme/widgets/referrers/$(printf 'sha256:%064d' 0)"
+# {"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}
+```
+
 ## Manifests by digest with oras
 
 `oras manifest push` addresses a manifest by its own digest, which means
@@ -217,6 +298,8 @@ leaves the other untouched.
 | end-9  | DELETE | `/v2/<name>/manifests/<digest\|tag>` |
 | end-10 | DELETE | `/v2/<name>/blobs/<digest>` |
 | end-11 | POST   | `/v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>` |
+| end-12a | GET   | `/v2/<name>/referrers/<digest>` |
+| end-12b | GET   | `/v2/<name>/referrers/<digest>?artifactType=<type>` |
 | end-13 | GET    | `/v2/<name>/blobs/uploads/<ref>` |
 
 ## Layout
@@ -225,10 +308,12 @@ leaves the other untouched.
 cmd/cairnd            wiring and the HTTP server
 internal/ocihttp      request parsing, status and error codes -- no storage logic
 internal/registry     the rules: digest verification, chunk ordering, scoping,
-                      manifest validation (manifest.go)
+                      manifest validation (manifest.go), tags (tag.go),
+                      referrers (referrers.go)
 internal/blobstore    committed bytes, addressed by digest
 internal/uploadstore  staged bytes of uploads that have no digest yet
-internal/metastore    the SQL index: blob membership and session state
+internal/metastore    the SQL index: membership, manifests, tags, referrers,
+                      session state
 internal/model        what a row holds
 internal/logging      logger construction: format, level, destination
 ```
@@ -256,11 +341,23 @@ transferring nothing.
 Manifests add two more questions a digest cannot answer. **What is this?** — a
 GET has to reply with the manifest's own media type, and reading and parsing the
 document to find out would make every HEAD a content read; `media_type` is a
-column so a HEAD touches only the index. And **what refers to this?** — the
-`subject` pointer lives inside the child, but every client wants to query it from
-the parent, which is a scan without an index and a seek with one. That second
-question is where SQL stops being a convenience, and it is the one still
-unanswered here: the column is populated, the endpoint is not written.
+column so a HEAD touches only the index.
+
+And **what refers to this?** — which is where SQL stops being a convenience. The
+`subject` pointer is stored on the child, because a signature knows what it signs,
+but every client asks from the other end: given an image, what has been said about
+it? That answer is not derivable from the subject's bytes and changes every time
+someone signs it, so content addressing cannot produce it at all. Something has to
+keep a mapping from subject back to the manifests naming it, and that something is
+`manifests_by_subject` — a scan of every manifest in the repository without it, a
+seek with it.
+
+The same reasoning decides how much of a manifest gets columns. A referrers
+response has to carry each referrer's `artifactType` and its annotations, since
+those are how a client picks one signature out of twenty without fetching them all.
+Leaving them in the bytes would mean reading and parsing every candidate manifest
+to answer one listing — the read amplification the endpoint exists to prevent — so
+`artifact_type` and `annotations` are columns too.
 
 Tags add the question that runs the other way. Content names itself, but nobody
 wants to type a digest, so **what does this name point at right now?** needs a
@@ -364,9 +461,93 @@ source itself and naming it becomes a disclosure as soon as there is auth.
 
 **A subject is recorded but never required to exist.** The spec is explicit that a
 referrer may be pushed before, or entirely without, its subject, and signing tools
-rely on it: cosign signs a digest, not a registry state. Validating it would break
-them, so `subject` is stored as an uninterpreted pointer and `OCI-Subject` is
+rely on it: cosign signs a digest, not a registry state. Validating existence would
+break them, so `subject` is stored as an uninterpreted pointer and `OCI-Subject` is
 echoed back so a client knows the pointer was understood.
+
+Its *syntax* is checked, though, which is not the same thing. An unparseable
+subject would be filed under a key no query could produce, so the referrer would be
+silently unfindable by the only endpoint that looks for it — a client error is far
+better than a signature that vanishes.
+
+**A referrers response is assembled, not stored.** The index end-12 returns was
+never pushed and has no stable digest, because the next signature pushed changes
+it. It is the one place this API steps outside content addressing, and that is
+precisely why the endpoint has to exist: the answer is a property of the store at a
+moment, not of any bytes in it.
+
+**`artifactType` in a response is not always what the manifest said.** The spec
+defines a fallback — an image manifest that declares none is described by its
+config's media type, an index that declares none has the field omitted entirely —
+which keeps the pre-1.1 convention of carrying the artifact's type in the config
+descriptor working.
+
+Resolving it happens once, at push time, so `artifact_type` holds the *effective*
+type. That is what makes the end-12b filter a column comparison instead of a rule
+reapplied to every row on every query, and it means the value you can filter on is
+the same value the listing shows.
+
+**A tag is not accepted as a subject.** Every other manifest endpoint takes a tag
+or a digest; end-12 takes only a digest. Resolving a tag would answer about
+whatever it points at *now*, while the referrers were filed against what it pointed
+at *then*, so every signature would appear to vanish the moment a tag moved.
+
+**`+` in the `artifactType` query is a plus, not a space.** Go's query parser
+follows the HTML form convention where `+` means a space, and almost every artifact
+type ends in `+json` — so a client sending the perfectly legal
+`?artifactType=application/vnd.example.sbom.v1+json` would be filtering on a type
+with a space in it. cairn percent-decodes without that substitution.
+
+It is safe to reinterpret because only one reading can ever be right: a media type
+cannot contain a space, so there is no input for which form decoding would have been
+correct, and an escaped `%2B` still arrives as `+`. The failure it avoids is the
+dangerous kind — an empty list is a well-formed answer meaning "nothing has been
+said about this", so a mangled filter reads as *unsigned* rather than as an error.
+
+**An unknown repository is a 404 from end-12, which is a reading of the spec rather
+than a transcription.** The spec says a registry supporting this API "MUST NOT
+return a 404 Not Found to a referrers API request", yet lists 404 among end-12a's
+failure codes, so the prohibition cannot be absolute. Taking it to mean "not for a
+subject with no referrers" satisfies both sentences.
+
+The alternative is worse where it matters: a mistyped repository would answer 200
+with an empty list, which a verification tool cannot distinguish from "this image is
+unsigned". And the cost of being wrong is bounded — a client that reads 404 as "no
+referrers API here" falls back to the referrers tag schema, which in a repository
+that does not exist is also a 404.
+
+**The referrers index is partial, and the query says so out loud.** Most manifests
+are not referrers, so `manifests_by_subject` covers only rows `WHERE subject != ''`
+— keeping it proportional to the number of signatures rather than to everything ever
+pushed, and keeping a plain image push from maintaining an entry it would never
+appear in.
+
+The query repeats that predicate, which looks redundant next to `subject = ?` and is
+not. SQLite chooses a partial index only when the WHERE clause implies the index's
+own predicate, and a bound parameter cannot be known to be non-empty, so removing
+the term turns the seek back into a scan. It also stops a caller passing an empty
+digest from matching every plain manifest in the repository. There is a test that
+reads `EXPLAIN QUERY PLAN`, because both mistakes return identical rows.
+
+**Opening and closing the database run `PRAGMA optimize`.** Not tuning: without
+statistics SQLite's planner rates a prefix seek of the primary key on `repository`
+alone as competitive with the subject index, and picks it — reading every manifest
+in the repository. The index is present and simply not chosen.
+
+`metastore.Optimize` is exported because the schedule cannot be decided here.
+Statistics are only as current as the last call, so a daemon that opens an empty
+database and then serves a million pushes holds an empty database's statistics for
+the whole run.
+
+**Column additions migrate; nothing else needs to.** `CREATE TABLE IF NOT EXISTS`
+silently does nothing when the table already exists, so a column added later never
+reaches a database an earlier build created — which is what the `annotations` column
+was. Indexes and new tables need no migration, since `CREATE ... IF NOT EXISTS` is
+reapplied on every open.
+
+Each migration asks the schema whether it has already been applied rather than
+consulting a recorded version, because a version number can drift out of step with
+the database it claims to describe.
 
 **Content-Type must agree with the document's `mediaType`.** Both describe the
 same bytes, and which one a proxy or cache downstream believes is not knowable
@@ -445,10 +626,19 @@ Nothing emits at debug yet, so `-log-level debug` only widens the filter.
   `n` gets a bounded page and a `Link`; one that does not gets the whole list,
   which for a repository with a very large number of tags is a response nobody
   wants. A default page size would fix it and is deliberately not invented here.
-- No referrers (end-12). The `subject` and `artifact_type` columns are populated
-  on every push, so the endpoint is a query away, but the index it wants is
-  deliberately absent until then — an unused index is only write amplification.
-  An earlier revision implemented end-12 over the same schema; see `git log`.
+- end-12 is not paginated. The spec requires a `Link` header when the descriptor
+  list will not fit in one response and leaves the threshold to the registry;
+  cairn returns all of them. In practice a subject accumulates signatures and
+  attestations rather than thousands of referrers, so this is a smaller hazard than
+  the tag listing above, but it is the same missing ceiling.
+- No backfill from the referrers tag schema. A registry enabling end-12 is meant
+  to surface referrers that clients previously recorded by pushing an index to a
+  `sha256-<subject>` tag. cairn never advertised the API as absent — it returns
+  `OCI-Subject`, which tells a client the API is live — so there should be no such
+  data, but a client that pushed to this store between the tag and referrer commits
+  could have created some, and nothing goes looking for it.
+- Statistics can go stale within a long run, degrading the referrers query plan.
+  See `metastore.Optimize`; a real deployment wants it on a timer.
 - Nothing is ever reclaimed. Deleting a blob or a manifest removes a row and
   leaves the bytes, and abandoned upload sessions keep their staged files. The
   schema has what a sweeper needs — `metastore.IsReferenced` for content and

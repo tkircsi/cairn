@@ -2,8 +2,13 @@
 //
 // It holds no bytes. Its job is to answer the questions a content-addressed
 // store cannot: which repository may read a given blob, what a manifest claims
-// to be, what name currently points at which manifest, and what state an
-// in-progress upload is in.
+// to be, what name currently points at which manifest, what refers to a given
+// manifest, and what state an in-progress upload is in.
+//
+// The referrers question is the one that could not be answered any other way. The
+// rest are conveniences a walk of the store could reconstruct slowly; "what points
+// at this" is not derivable from the bytes being asked about at all, and its answer
+// changes without them changing.
 package metastore
 
 import (
@@ -18,7 +23,7 @@ import (
 // ErrNotFound is returned when a row is absent.
 var ErrNotFound = errors.New("not found")
 
-// Store indexes blob membership and upload sessions.
+// Store indexes blob membership, manifests, tags, referrers and upload sessions.
 type Store interface {
 	// PutBlob records that a repository contains a blob. It is idempotent: the
 	// same bytes pushed twice is the normal case, not an error.
@@ -46,6 +51,26 @@ type Store interface {
 	// deleted, and an implementation that left the rows would advertise tags that
 	// cannot be fetched.
 	DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error
+	// Referrers lists the manifests in a repository that name subject, newest
+	// first, optionally narrowed to one artifact type. An empty artifactType means
+	// no filter, which is unambiguous because the empty string is not a legal
+	// artifact type.
+	//
+	// The subject need not exist, and an empty result is not an error. Both follow
+	// from what the question means: "what points at this" is answerable without the
+	// target being present, and a registry that 404'd instead would be telling a
+	// client that no signatures exist in the same way it reports a broken URL.
+	//
+	// Implementations MUST return the effective artifact type rather than what the
+	// document literally said, and MUST return the manifest's annotations. Those
+	// are what a client uses to choose which referrer to fetch, so a response
+	// without them forces it to fetch all of them.
+	Referrers(
+		ctx context.Context,
+		repository string,
+		subject digest.Digest,
+		artifactType string,
+	) ([]model.Manifest, error)
 
 	// PutTag points a tag at a manifest, creating it or moving it if it exists.
 	// Moving is expected traffic rather than a conflict, which is how a release

@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -498,5 +499,283 @@ func TestManifestWithoutASubjectStoresAnEmptyPointer(t *testing.T) {
 
 	if got.ArtifactType != "" {
 		t.Errorf("ArtifactType = %q, want empty", got.ArtifactType)
+	}
+}
+
+// putReferrer files a manifest naming subject, at a given time so that ordering is
+// deterministic rather than dependent on how fast the test runs.
+func putReferrer(
+	t *testing.T,
+	store *sqlite.Store,
+	repository string,
+	dgst, subject digest.Digest,
+	artifactType string,
+	at time.Time,
+) {
+	t.Helper()
+
+	err := store.PutManifest(context.Background(), model.Manifest{
+		Repository:   repository,
+		Digest:       dgst,
+		MediaType:    "application/vnd.oci.image.manifest.v1+json",
+		ArtifactType: artifactType,
+		Subject:      subject,
+		Size:         11,
+		CreatedAt:    at,
+	})
+	if err != nil {
+		t.Fatalf("PutManifest: %v", err)
+	}
+}
+
+// TestReferrersAreNewestFirst pins the order. The spec requires none, which is
+// exactly why it is worth fixing here: an unordered SQL result may differ between
+// two identical queries, and a client paging or diffing the list would see churn
+// that no push caused.
+func TestReferrersAreNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	store := open(t)
+
+	const (
+		repo         = "acme/widgets"
+		artifactType = "application/vnd.example.signature.v1+json"
+	)
+
+	subject := digest.FromString("a subject")
+	base := time.Now().Truncate(time.Second)
+
+	var (
+		oldest = digest.FromString("oldest")
+		middle = digest.FromString("middle")
+		newest = digest.FromString("newest")
+	)
+
+	// Inserted out of order, so passing cannot be an accident of insertion order.
+	putReferrer(t, store, repo, middle, subject, artifactType, base.Add(time.Minute))
+	putReferrer(t, store, repo, oldest, subject, artifactType, base)
+	putReferrer(t, store, repo, newest, subject, artifactType, base.Add(2*time.Minute))
+
+	got, err := store.Referrers(ctx, repo, subject, "")
+	if err != nil {
+		t.Fatalf("Referrers: %v", err)
+	}
+
+	want := []digest.Digest{newest, middle, oldest}
+
+	if len(got) != len(want) {
+		t.Fatalf("got %d referrers, want %d", len(got), len(want))
+	}
+
+	for i := range want {
+		if got[i].Digest != want[i] {
+			t.Errorf("referrer %d = %s, want %s", i, got[i].Digest, want[i])
+		}
+	}
+}
+
+// TestReferrersIgnoreManifestsWithoutASubject is the test the partial index makes
+// worth stating. Ordinary manifests are stored with subject = ”, so a query that
+// leaked them would return every manifest in the repository for a subject of ”.
+func TestReferrersIgnoreManifestsWithoutASubject(t *testing.T) {
+	ctx := context.Background()
+	store := open(t)
+
+	const repo = "acme/widgets"
+
+	err := store.PutManifest(ctx, model.Manifest{
+		Repository: repo,
+		Digest:     digest.FromString("a plain image"),
+		MediaType:  "application/vnd.oci.image.manifest.v1+json",
+		Size:       3,
+		CreatedAt:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("PutManifest: %v", err)
+	}
+
+	// The empty digest is what a caller would pass if it read a missing subject as a
+	// query rather than as absence.
+	got, err := store.Referrers(ctx, repo, "", "")
+	if err != nil {
+		t.Fatalf("Referrers: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Errorf("got %d referrers for an empty subject, want none: %v", len(got), got)
+	}
+}
+
+// TestAnnotationsRoundTrip covers the JSON text column, including the nil case,
+// which has to come back nil rather than as an empty map so that a descriptor built
+// from it omits the field.
+func TestAnnotationsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := open(t)
+
+	const repo = "acme/widgets"
+
+	for _, tc := range []struct {
+		name string
+		want map[string]string
+	}{
+		{"none", nil},
+		{"one", map[string]string{"org.example.signer": "alice"}},
+		{"awkward values", map[string]string{
+			"org.example.quoted":  `he said "hello"`,
+			"org.example.empty":   "",
+			"org.example.unicode": "café ✓",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dgst := digest.FromString("manifest " + tc.name)
+
+			err := store.PutManifest(ctx, model.Manifest{
+				Repository:  repo,
+				Digest:      dgst,
+				MediaType:   "application/vnd.oci.image.manifest.v1+json",
+				Annotations: tc.want,
+				Size:        13,
+				CreatedAt:   time.Now(),
+			})
+			if err != nil {
+				t.Fatalf("PutManifest: %v", err)
+			}
+
+			got, err := store.Manifest(ctx, repo, dgst)
+			if err != nil {
+				t.Fatalf("Manifest: %v", err)
+			}
+
+			if tc.want == nil {
+				if got.Annotations != nil {
+					t.Errorf("Annotations = %v, want nil", got.Annotations)
+				}
+
+				return
+			}
+
+			if len(got.Annotations) != len(tc.want) {
+				t.Fatalf("got %d annotations, want %d: %v",
+					len(got.Annotations), len(tc.want), got.Annotations)
+			}
+
+			for k, v := range tc.want {
+				if got.Annotations[k] != v {
+					t.Errorf("annotation %q = %q, want %q", k, got.Annotations[k], v)
+				}
+			}
+		})
+	}
+}
+
+// TestOpenMigratesAnExistingDatabase is the test that catches the failure mode
+// CREATE TABLE IF NOT EXISTS hides: it silently does nothing when the table is
+// already there, so a column added to the schema never reaches a database created
+// by an earlier build. Without the ALTER, this would fail on "no such column".
+func TestOpenMigratesAnExistingDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cairn.db")
+
+	// The manifests table as it stood before referrers existed. Deliberately
+	// hand-written rather than derived from the current schema, because a constant
+	// that tracked the code would stop describing the thing being migrated from.
+	const old = `
+CREATE TABLE manifests (
+    repository    TEXT    NOT NULL,
+    digest        TEXT    NOT NULL,
+    media_type    TEXT    NOT NULL,
+    artifact_type TEXT    NOT NULL DEFAULT '',
+    subject       TEXT    NOT NULL DEFAULT '',
+    size          INTEGER NOT NULL,
+    created_at    TEXT    NOT NULL,
+    PRIMARY KEY (repository, digest)
+) WITHOUT ROWID`
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, old); err != nil {
+		t.Fatalf("create old schema: %v", err)
+	}
+
+	// A row from the old build, to check the migration preserves data rather than
+	// only making the schema agree.
+	_, err = db.ExecContext(ctx, `
+INSERT INTO manifests (repository, digest, media_type, artifact_type, subject, size, created_at)
+VALUES ('acme/widgets', 'sha256:abc', 'application/vnd.oci.image.manifest.v1+json', '', '', 5, '2026-01-01T00:00:00Z')`)
+	if err != nil {
+		t.Fatalf("insert legacy row: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	store, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open migrated: %v", err)
+	}
+
+	t.Cleanup(func() { store.Close() })
+
+	got, err := store.Manifest(ctx, "acme/widgets", "sha256:abc")
+	if err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+
+	// The pre-existing row has no annotations, and the column default is what makes
+	// that readable at all.
+	if got.Annotations != nil {
+		t.Errorf("Annotations = %v, want nil", got.Annotations)
+	}
+
+	// And the column has to be usable for writing, not merely present.
+	err = store.PutManifest(ctx, model.Manifest{
+		Repository:  "acme/widgets",
+		Digest:      digest.FromString("after the migration"),
+		MediaType:   "application/vnd.oci.image.manifest.v1+json",
+		Subject:     digest.FromString("a subject"),
+		Annotations: map[string]string{"org.example.signer": "alice"},
+		Size:        7,
+		CreatedAt:   time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("PutManifest after migration: %v", err)
+	}
+
+	referrers, err := store.Referrers(ctx, "acme/widgets", digest.FromString("a subject"), "")
+	if err != nil {
+		t.Fatalf("Referrers: %v", err)
+	}
+
+	if len(referrers) != 1 || referrers[0].Annotations["org.example.signer"] != "alice" {
+		t.Errorf("referrers = %v, want one carrying the annotation", referrers)
+	}
+}
+
+// TestOpenIsIdempotent guards the migration's guard: opening twice must not try to
+// add a column that is already there, which is an error and not a no-op in SQLite.
+func TestOpenIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cairn.db")
+
+	first, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	second, err := sqlite.Open(ctx, path)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+
+	if err := second.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

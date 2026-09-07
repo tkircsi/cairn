@@ -100,6 +100,16 @@ func nextPageLink(name string, limit int, last string) string {
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
+	writeJSONAs(w, status, "application/json", body)
+}
+
+// writeJSONAs is writeJSON for a body whose media type the spec fixes to
+// something more specific -- a referrers response must be announced as an image
+// index, not as generic JSON, because clients dispatch on it.
+//
+// Marshalling before writing the status is deliberate: a marshal that fails after
+// a 200 has been sent cannot be reported, and would truncate the body instead.
+func writeJSONAs(w http.ResponseWriter, status int, mediaType string, body any) {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		writeServerError(w, err)
@@ -107,7 +117,7 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", mediaType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(raw)))
 	w.WriteHeader(status)
 

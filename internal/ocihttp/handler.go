@@ -17,12 +17,17 @@
 //	end-9   DELETE /v2/<name>/manifests/<reference>
 //	end-10  DELETE /v2/<name>/blobs/<digest>
 //	end-11  POST   /v2/<name>/blobs/uploads/?mount=&from=
+//	end-12a GET    /v2/<name>/referrers/<digest>
+//	end-12b GET    /v2/<name>/referrers/<digest>?artifactType=
 //	end-13  GET    /v2/<name>/blobs/uploads/<ref>       session status
 //
-// A manifest reference is a digest or a tag. Blob references are always digests,
-// which is not an omission: a blob is opaque and has no name but its content.
+// A manifest reference is a digest or a tag. Blob and referrers references are
+// always digests. For a blob that is not an omission -- it is opaque and has no
+// name but its content -- and for referrers it is deliberate, for the reason given
+// in referrers.go.
 //
-// Manifest endpoints live in manifest.go, tag listing in tags.go.
+// Manifest endpoints live in manifest.go, tag listing in tags.go, referrers in
+// referrers.go.
 //
 // The handler's whole job is translation: it parses a request into the arguments
 // the registry takes, and turns the registry's outcomes into the status and error
@@ -105,16 +110,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.manifest(w, r, name, tail)
 	case sectionTags:
 		h.tags(w, r, name, tail)
+	case sectionReferrers:
+		h.referrers(w, r, name, tail)
 	}
 }
 
 // Route sections, which are the only path components after a repository name.
-var sections = []string{sectionBlobs, sectionManifests, sectionTags}
+var sections = []string{sectionBlobs, sectionManifests, sectionTags, sectionReferrers}
 
 const (
 	sectionBlobs     = "/blobs"
 	sectionManifests = "/manifests"
 	sectionTags      = "/tags"
+	sectionReferrers = "/referrers"
 )
 
 // splitPath separates a repository name from the endpoint acting on it.

@@ -63,6 +63,12 @@ type Manifest struct {
 	// ArtifactType is the OCI 1.1 field describing what an artifact *is*, as
 	// distinct from how it is encoded. It is the filter a referrers query
 	// applies, which is why it is a column and not left inside the bytes.
+	//
+	// This holds the *effective* type rather than verbatim what the document said.
+	// The spec defines a fallback -- an image manifest without one is described by
+	// its config's media type, an index without one has none -- and resolving it
+	// once at write time is what lets the referrers filter be a column comparison
+	// instead of a rule reapplied per row on every query.
 	ArtifactType string
 	// Subject is the manifest this one makes a statement about -- a signature,
 	// an SBOM, an attestation -- and is empty for a manifest that stands alone.
@@ -71,9 +77,16 @@ type Manifest struct {
 	// The pointer is stored on the child, but every client wants to query it from
 	// the parent: "what refers to this?". Answering that by scanning manifests is
 	// O(N); answering it from an index on this column is a seek.
-	Subject   digest.Digest
-	Size      int64
-	CreatedAt time.Time
+	Subject digest.Digest
+	// Annotations are the manifest's own annotations, which a referrers response
+	// has to reproduce: they are how a client tells two signatures apart without
+	// fetching either, so leaving them in the bytes would make listing referrers a
+	// read of every one of them.
+	//
+	// Nil when the manifest has none, which is the common case.
+	Annotations map[string]string
+	Size        int64
+	CreatedAt   time.Time
 }
 
 // Tag is a human-chosen name for a manifest.
