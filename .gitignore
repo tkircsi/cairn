@@ -3,3 +3,5 @@
 /cairnd
 .conformance/
 conformance-report/
+/.bench/
+/bench/results/*.log

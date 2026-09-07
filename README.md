@@ -703,6 +703,32 @@ reference that is neither a digest nor a legal tag was answered 400, and the sui
 requires 404 — it asks for `.INVALID_MANIFEST_NAME` under the name "nonexistent
 manifest".
 
+## Benchmark
+
+Conformance says cairn is correct. It says nothing about whether the SQL index earns
+its keep, which is the only reason this project exists — so there is a benchmark for
+that one question:
+
+```sh
+./scripts/bench-referrers.sh
+```
+
+It pushes 3000 referrers onto a single live subject — the shape a scan pipeline
+produces against a record it re-scans on a schedule — and measures cairn against Zot
+v2.1.20 and Distribution v3.1.1 on the same workload. `bench/README.md` has the
+results and, more importantly, the four things they do not show.
+
+The short version: cairn's cost to record a referrer does not move between the 100th
+and the 3000th, and neither does an unrelated `HEAD`. Zot's write cost grows 5.7×, and
+the unrelated `HEAD` grows 3.5× with it — the cost does not stay inside the feature
+that caused it. Distribution's own write is the flattest of the three, because it
+writes a link file and shares no document; it has no end-12 at all, so its clients
+rebuild the answer themselves at 18.57 µs per accumulated referrer, per push.
+
+That last one is the result worth keeping. It says the work end-12 does is not
+optional: without the endpoint it does not disappear, it relocates to a client that
+cannot do it atomically.
+
 ## Tests
 
 ```sh
