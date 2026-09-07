@@ -1,0 +1,25 @@
+registry,mode,attempted,errors,reachable,verdict
+cairn,serial,6,0,6,OK
+cairn,concurrent,2,0,2,OK
+cairn,concurrent,4,0,4,OK
+cairn,concurrent,6,0,6,OK
+cairn,concurrent,8,0,8,OK
+cairn,concurrent,16,0,16,OK
+cairn,concurrent,32,0,32,OK
+cairn,concurrent,64,0,64,OK
+zot,serial,6,0,6,OK
+zot,concurrent,2,0,2,OK
+zot,concurrent,4,0,4,OK
+zot,concurrent,6,0,6,OK
+zot,concurrent,8,0,8,OK
+zot,concurrent,16,0,16,OK
+zot,concurrent,32,0,32,OK
+zot,concurrent,64,0,64,OK
+distribution,serial,6,0,6,OK
+distribution,concurrent,2,0,1,LOST 1
+distribution,concurrent,4,0,1,LOST 3
+distribution,concurrent,6,0,2,LOST 4
+distribution,concurrent,8,0,2,LOST 6
+distribution,concurrent,16,0,4,LOST 12
+distribution,concurrent,32,0,5,LOST 27
+distribution,concurrent,64,0,12,LOST 52

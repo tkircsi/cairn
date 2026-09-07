@@ -52,6 +52,14 @@ func WithLogging(h http.Handler, logger *slog.Logger) http.Handler {
 			attrs = append(attrs, slog.String("digest", dgst))
 		}
 
+		// The cause of a 500, which the response deliberately does not carry. Logged as a
+		// value so an error message built from client input cannot forge a record, and
+		// attached here rather than logged where it happened so a failed request is still
+		// one line with its method, path and timing already on it.
+		if recorder.fault != nil {
+			attrs = append(attrs, slog.String("error", recorder.fault.Error()))
+		}
+
 		logger.LogAttrs(r.Context(), levelFor(recorder.status), "request", attrs...)
 	})
 }
@@ -84,6 +92,16 @@ type responseRecorder struct {
 	status      int
 	written     int64
 	wroteHeader bool
+	// fault is the cause of a 500, which the response body withholds.
+	fault error
+}
+
+// recordFault implements faultRecorder. First writer wins: the first failure is the one
+// that caused the response, and anything after it is a consequence.
+func (w *responseRecorder) recordFault(err error) {
+	if w.fault == nil {
+		w.fault = err
+	}
 }
 
 func (w *responseRecorder) WriteHeader(status int) {

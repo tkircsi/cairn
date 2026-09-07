@@ -1,3 +1,87 @@
+# Benchmarks
+
+Two questions, one per script. `scripts/bench-referrers.sh` asks what referrers cost as
+they accumulate; `scripts/concurrency.sh` asks whether they survive being written at the
+same time. The second is the shorter write-up and the more important result, so it comes
+first.
+
+# Concurrent attach: does a referrer survive being written?
+
+```sh
+./scripts/concurrency.sh                    # all three
+ARMS="8 32 64" ./scripts/concurrency.sh cairn
+```
+
+This reproduces a test from the registry evaluation that preceded cairn, where
+Distribution lost referrers silently. `oras attach` is the client, deliberately: it is
+the same `oras-go` path Directory's `PushReferrer` uses, and it chooses the native or
+fallback route by itself. The original arms — 6 serial, then 2/4/6/8 concurrent — are
+kept verbatim, with higher ones added.
+
+| concurrency | cairn | Zot v2.1.20 | Distribution v3.1.1 |
+|---|---|---|---|
+| 6 serial | 6/6 | 6/6 | 6/6 |
+| 2 | 2/2 | 2/2 | **1/2** |
+| 4 | 4/4 | 4/4 | **1/4** |
+| 6 | 6/6 | 6/6 | **2/6** |
+| 8 | 8/8 | 8/8 | **2/8** |
+| 16 | 16/16 | 16/16 | **4/16** |
+| 32 | 32/32 | 32/32 | **5/32** |
+| 64 | 64/64 | 64/64 | **12/64** |
+| 128 | 128/128 | — | — |
+| 256 | 256/256 | — | — |
+
+**Every attach exited 0.** In every Distribution row, `oras` reported success for
+referrers that are not reachable afterwards. The manifest is in the registry; nothing
+points at it, so `oras discover` will never return it and no caller sees an error. At 64
+concurrent, 52 of them are gone and nothing anywhere says so.
+
+The cause is the fallback index: with no referrers API, each client fetches the
+`sha256-<subject>` index, appends its descriptor, and pushes it back. Concurrent clients
+read the same version and each writes back one missing the others' entries. Last writer
+wins the whole document, and no client can make that atomic from outside the registry.
+
+The serial row is the control. Without it, a 1/8 could just mean the attaches never
+worked.
+
+Two honest notes. The original run reported every concurrent batch collapsing to exactly
+one survivor; here the higher arms leave a handful more (2, 4, 5, 12), presumably because
+more clients means more chances to interleave between a read and a write. The shape is
+the same and the direction is the same, but this is not a digit-for-digit reproduction —
+different Distribution version, different machine. And cairn's 128 and 256 rows have no
+counterpart because they were run separately, to find cairn's limit rather than to
+compare.
+
+## What it found in cairn
+
+cairn passes every arm now. It did not when the test was first run, and the failure was
+not in the referrers path at all.
+
+`oras push` uploads a manifest's blobs concurrently, so an ordinary push closes two
+upload sessions at once. One of them returned `500 unsupported: internal error` on a
+completely valid push. The cause was that `Open` applied its pragmas with `db.Exec` on a
+`*sql.DB`, which is a *pool*: `busy_timeout`, `foreign_keys` and `analysis_limit`
+configure a connection rather than the database, so they landed on whichever connection
+ran them and no other. Every later connection had no busy timeout — a concurrent write
+failed instantly with `SQLITE_BUSY` instead of waiting — and, worse, no foreign key
+enforcement, so the schema's cascades were silently unenforced on most connections.
+
+Nothing sequential could see it. One caller at a time reuses the one configured
+connection, which is why the test suite, the OCI conformance suite and a 3000-push
+benchmark all passed while the pool held unconfigured connections it had never needed.
+
+The pragmas now travel in the DSN, so every connection gets them, and
+`internal/metastore/sqlite/pragma_test.go` holds four connections open at once and asserts
+each is configured. Finding this is the argument for the test: correctness under
+concurrency is not what the referrers benchmark measures, and a sequential suite cannot
+see a pool.
+
+It also exposed a second, smaller thing. The 500 was undiagnosable because
+`writeServerError` discarded the error — the access log recorded that a request failed
+and the reason existed nowhere. The cause now rides on the response recorder into the
+existing log record, so a failed request is still one line, and the client's response is
+unchanged.
+
 # Referrers under accumulation
 
 cairn keeps an SQL index for one reason: "what refers to this manifest" is not

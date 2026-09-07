@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/opencontainers/go-digest"
@@ -141,27 +142,60 @@ type Store struct {
 	db *sql.DB
 }
 
-// Open opens (creating if needed) the database at dsn.
-func Open(ctx context.Context, dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+// dsn turns a filesystem path into a connection string carrying the pragmas.
+//
+// Built as a URI so the path is escaped rather than trusted to contain no character the
+// query parser cares about: a temporary directory or a data root with a "?" in it would
+// otherwise have part of its name read as settings.
+func dsn(path string) string {
+	query := make(url.Values, len(pragmas))
+	for _, pragma := range pragmas {
+		query.Add("_pragma", pragma)
 	}
 
-	for _, pragma := range []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA foreign_keys = ON",
-		// Bounds how much of an index ANALYZE will read, so gathering statistics stays
-		// proportional to nothing in particular rather than to the size of the database.
-		// SQLite's own recommended value.
-		"PRAGMA analysis_limit = 400",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			db.Close()
+	uri := url.URL{Scheme: "file", Opaque: (&url.URL{Path: path}).EscapedPath()}
+	uri.RawQuery = query.Encode()
 
-			return nil, fmt.Errorf("apply %q: %w", pragma, err)
-		}
+	return uri.String()
+}
+
+// pragmas configure every connection, and are passed in the DSN rather than executed
+// after opening.
+//
+// The distinction is not stylistic. database/sql is a pool, and most PRAGMAs configure a
+// connection rather than the database -- journal_mode is recorded in the file and
+// persists, but busy_timeout, foreign_keys and analysis_limit reset to their defaults on
+// every new connection. Running them with db.Exec configures whichever connection the
+// pool happened to hand over and no other, so the second connection has no busy timeout
+// and no foreign key enforcement.
+//
+// Nothing sequential can see it. One caller at a time reuses the one configured
+// connection, so a full test suite, the OCI conformance suite and a 3000-push benchmark
+// all pass while the pool holds unconfigured connections it has never needed. The
+// symptom only appears when two callers arrive together -- as they do on an ordinary
+// `oras push`, which uploads a manifest's blobs concurrently -- and then it is a 500 with
+// nothing to connect it back to here.
+var pragmas = []string{
+	// Wait for a competing writer rather than failing at once. Without this a
+	// concurrent write returns SQLITE_BUSY immediately, which the HTTP layer can only
+	// report as an internal error for a request that was entirely valid.
+	"busy_timeout(5000)",
+	// The schema's cascades are declared as foreign keys, and SQLite does not enforce
+	// them unless asked, per connection. Off, deletes silently leave the rows they
+	// promised to remove.
+	"foreign_keys(1)",
+	"journal_mode(WAL)",
+	// Bounds how much of an index ANALYZE will read, so gathering statistics stays
+	// proportional to nothing in particular rather than to the size of the database.
+	// SQLite's own recommended value.
+	"analysis_limit(400)",
+}
+
+// Open opens (creating if needed) the database at path.
+func Open(ctx context.Context, path string) (*Store, error) {
+	db, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
 	}
 
 	if _, err := db.ExecContext(ctx, schema); err != nil {

@@ -703,20 +703,36 @@ reference that is neither a digest nor a legal tag was answered 400, and the sui
 requires 404 — it asks for `.INVALID_MANIFEST_NAME` under the name "nonexistent
 manifest".
 
-## Benchmark
+## Benchmarks
 
-Conformance says cairn is correct. It says nothing about whether the SQL index earns
-its keep, which is the only reason this project exists — so there is a benchmark for
-that one question:
+Conformance says cairn is correct one request at a time. It says nothing about whether
+the SQL index earns its keep, and nothing about what happens when two clients arrive
+together — so there is a script for each:
 
 ```sh
-./scripts/bench-referrers.sh
+./scripts/bench-referrers.sh   # what referrers cost as they accumulate
+./scripts/concurrency.sh       # whether they survive being written at once
 ```
 
-It pushes 3000 referrers onto a single live subject — the shape a scan pipeline
-produces against a record it re-scans on a schedule — and measures cairn against Zot
-v2.1.20 and Distribution v3.1.1 on the same workload. `bench/README.md` has the
-results and, more importantly, the four things they do not show.
+Take the second one first, because it found a bug that had survived everything else.
+Sixty-four clients attaching referrers to one subject: cairn keeps 64 of 64, Zot keeps 64
+of 64, and Distribution keeps 12 — while every single attach exits 0. Its referrers are in
+the registry with nothing pointing at them, so no client can find them and none is told.
+That is the fallback index again, from the correctness side rather than the cost side:
+concurrent clients read the same document and each writes back a version missing the
+others.
+
+cairn did not pass that test at first, and not on the referrers path. `oras push` uploads
+a manifest's blobs concurrently, and one of the two would fail with a 500 on a valid push,
+because `Open` set its pragmas with `db.Exec` on a connection *pool* — so `busy_timeout`
+and `foreign_keys` configured one connection and no other. Every later connection had no
+busy timeout and, worse, no foreign key enforcement. Nothing sequential could see it,
+which is exactly why the test suite and the conformance run did not.
+
+The other script pushes 3000 referrers onto a single live subject — the shape a scan
+pipeline produces against a record it re-scans on a schedule — and measures the same
+three registries on that workload. `bench/README.md` has both sets of results and,
+more importantly, the four things the timings do not show.
 
 The short version: cairn's cost to record a referrer does not move between the 100th
 and the 3000th, and neither does an unrelated `HEAD`. Zot's write cost grows 5.7×, and

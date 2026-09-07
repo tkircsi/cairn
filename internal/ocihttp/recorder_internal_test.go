@@ -1,6 +1,7 @@
 package ocihttp
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,61 @@ func TestRecorderKeepsFirstStatus(t *testing.T) {
 
 	if recorder.status != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", recorder.status)
+	}
+}
+
+// TestServerErrorRecordsCauseButDoesNotSendIt covers both halves of a 500: the client
+// is told nothing beyond "internal error", and the log is told everything.
+//
+// Both directions need pinning. Leaking the detail to the client would put filesystem
+// paths or SQL text in a response, and withholding it from the log -- the original
+// behaviour -- leaves a failing request with no recorded cause at all.
+func TestServerErrorRecordsCauseButDoesNotSendIt(t *testing.T) {
+	inner := httptest.NewRecorder()
+	recorder := &responseRecorder{ResponseWriter: inner, status: http.StatusOK}
+
+	writeServerError(recorder, errors.New("insert blob: database is locked (5) (SQLITE_BUSY)"))
+
+	if recorder.fault == nil {
+		t.Fatal("no cause recorded: a 500 would be logged with nothing to explain it")
+	}
+
+	if !strings.Contains(recorder.fault.Error(), "SQLITE_BUSY") {
+		t.Errorf("recorded cause = %q, want it to carry the underlying error", recorder.fault)
+	}
+
+	if got := inner.Body.String(); strings.Contains(got, "SQLITE_BUSY") {
+		t.Errorf("response body leaked the cause: %s", got)
+	}
+
+	if inner.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", inner.Code)
+	}
+}
+
+// TestServerErrorKeepsFirstCause pins first-writer-wins: the first failure is the one
+// that caused the response, and a later one is a consequence of it.
+func TestServerErrorKeepsFirstCause(t *testing.T) {
+	recorder := &responseRecorder{ResponseWriter: httptest.NewRecorder(), status: http.StatusOK}
+
+	recorder.recordFault(errors.New("first"))
+	recorder.recordFault(errors.New("second"))
+
+	if got := recorder.fault.Error(); got != "first" {
+		t.Errorf("cause = %q, want %q", got, "first")
+	}
+}
+
+// TestServerErrorWithoutRecorderDoesNotPanic covers an unwrapped Handler, which is how
+// most of the tests here drive it and how anyone embedding it without the access log
+// would.
+func TestServerErrorWithoutRecorderDoesNotPanic(t *testing.T) {
+	plain := httptest.NewRecorder()
+
+	writeServerError(plain, errors.New("boom"))
+
+	if plain.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", plain.Code)
 	}
 }
 

@@ -528,11 +528,29 @@ func writeUploadError(w http.ResponseWriter, err error) {
 	}
 }
 
-// writeServerError reports a fault without describing it.
+// faultRecorder is implemented by the access log's response recorder, and is how the
+// cause of a 500 reaches the log without reaching the client.
+//
+// An interface rather than a concrete type so a Handler still works when it is not
+// wrapped -- as it is not in most of the tests -- and so another wrapper can opt in.
+type faultRecorder interface {
+	recordFault(error)
+}
+
+// writeServerError reports a fault to the client without describing it, and to the log
+// with the description.
 //
 // The detail goes nowhere a client can see: an internal error message can carry
-// filesystem paths or SQL text, and a caller can do nothing with either.
-func writeServerError(w http.ResponseWriter, _ error) {
+// filesystem paths or SQL text, and a caller can do nothing with either. But discarding
+// it entirely, which is what this did at first, means a 500 leaves no trace of its cause
+// anywhere -- the access log records that the request failed and the reason is gone. That
+// cost real time: an ordinary `oras push` was failing on a concurrent write, and the only
+// evidence was a status code.
+func writeServerError(w http.ResponseWriter, err error) {
+	if recorder, ok := w.(faultRecorder); ok {
+		recorder.recordFault(err)
+	}
+
 	writeError(w, http.StatusInternalServerError, "UNSUPPORTED", "internal error")
 }
 
