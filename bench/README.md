@@ -82,6 +82,85 @@ and the reason existed nowhere. The cause now rides on the response recorder int
 existing log record, so a failed request is still one line, and the client's response is
 unchanged.
 
+# Mirroring real data in with regsync
+
+```sh
+./scripts/regsync.sh              # sample of 300 records
+./scripts/regsync.sh all          # everything the source has
+MEASURE_ONLY=1 ./scripts/regsync.sh 300   # re-time without re-transferring
+```
+
+Mirrors a real Directory repository into cairn and then measures both sides on the same
+content. Two questions, and only one is about speed.
+
+**Is cairn a usable mirror target for a client that is not oras?** regsync is regclient, an
+independent implementation of the same spec, and it is the tool Directory's own migration
+job runs. The config this script generates mirrors that job's: `parallel`, `digestTags:
+false`, `referrers: true`. The last one matters — with referrers off, a record arrives
+without its signature and the mirror is quietly incomplete.
+
+Verification does not trust regsync's exit code, because that reports what was attempted.
+Every record is re-read from both registries and compared on digest and on the set of
+referrer digests attached to it.
+
+**How long does each side take to answer?** This is the measurement the earlier registry
+evaluation left unfinished: a referrer lookup on a production Zot clone took 7.9 seconds,
+Distribution answered in 2 ms but only because clients had pre-built the index, and cairn
+had no number at all.
+
+## The shape of the data
+
+One repository, `dir`, holding everything. Records are tags named by their CID — and so
+are referrers, each self-tagged by its own CID. The namespace is a flat mix of the two,
+distinguishable only by whether a manifest carries a `subject`, which is why the record
+list comes from `dirctl search` rather than from the registry: classifying tags from the
+registry side costs one manifest fetch each.
+
+Measured against the source used here:
+
+```
+tags in the repository              14803
+records known to Directory           3970
+records that are tagged (mirrorable) 2953
+records known but not tagged         1017
+self-tagged referrers               11850
+referrers per record                 4.01
+```
+
+One repository with ~15k tags is the case Zot is least suited to, and it is not synthetic.
+The 1,017 records Directory knows about but the registry has no tag for are an artifact of
+the source being a frozen backup that predates them, not registry drift.
+
+## Results
+
+A 40-record validation run: **40/40 records mirrored, 182 referrers, zero missing, zero
+digest mismatches, zero referrer gaps.** cairn accepted everything regclient sent,
+including manifests whose config descriptor carries inlined `data` — regsync pushes that
+blob explicitly, so cairn's requirement that referenced blobs exist is satisfied.
+
+Latencies, with a `GET /v2/` baseline subtracted:
+
+| | cairn | source Zot |
+|---|---|---|
+| baseline `GET /v2/` | 0.16 ms | 116.31 ms |
+| referrer lookup | 0.49 ms over baseline | 524.76 ms over baseline |
+| tag list | 0.37 ms (40 tags) | 94.37 ms (14803 tags) |
+
+The baseline is load-bearing. An earlier version of this script opened a fresh connection
+per request and reported 870 ms for the source, most of which was a TLS handshake across
+the internet. Read the over-baseline column; the raw numbers differ by a round trip before
+either registry does any work.
+
+The 525 ms is Zot doing real work — reading the repository index and parsing manifests to
+check subjects, consistent with the 7.9 s figure from the earlier evaluation at roughly
+double the manifest count on different hardware.
+
+**Caveat on this table:** cairn held 40 tags against the source's 14,803, so its 0.49 ms is
+measured on a nearly empty registry. Run with `all` to close that gap. Note that a full
+run is slow for a reason worth recording: regsync must ask the source "what refers to this
+record?" once per record, at ~560 ms each, so mirroring is throttled by the very lookup
+under test — raising `parallel` from 4 to 16 changed throughput not at all.
+
 # Referrers under accumulation
 
 cairn keeps an SQL index for one reason: "what refers to this manifest" is not
