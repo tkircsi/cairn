@@ -1,0 +1,18 @@
+{
+  "source": "prod.zot.ads.outshift.io",
+  "repository": "dir",
+  "records_requested": 40,
+  "records_missing": 0,
+  "digest_mismatches": 0,
+  "referrers_expected": 182,
+  "records_with_referrer_gaps": 0,
+  "sync_seconds": 0.0,
+  "cairn_tags": 40,
+  "cairn_tag_list_ms": 0.619,
+  "source_tags": 14803,
+  "source_tag_list_ms": 243.367,
+  "cairn_baseline_ms": 0.164,
+  "source_baseline_ms": 121.329,
+  "cairn_referrers_ms": 0.584,
+  "source_referrers_ms": 563.971
+}
