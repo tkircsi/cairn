@@ -34,9 +34,11 @@ func main() {
 
 func run() error {
 	var (
-		addr      = flag.String("addr", "127.0.0.1:5050", "address to listen on")
-		root      = flag.String("root", "data", "directory for blobs, uploads and the index")
-		maxBlob   = flag.Int64("max-blob-size", registry.DefaultMaxBlobSize, "largest blob accepted, in bytes")
+		addr    = flag.String("addr", "127.0.0.1:5050", "address to listen on")
+		root    = flag.String("root", "data", "directory for blobs, uploads and the index")
+		maxBlob = flag.Int64("max-blob-size", registry.DefaultMaxBlobSize, "largest blob accepted, in bytes")
+		maxMani = flag.Int64("max-manifest-size", registry.DefaultMaxManifestSize,
+			"largest manifest accepted, in bytes")
 		logFormat = flag.String("log-format", "text", "log format: text or json")
 		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn or error")
 	)
@@ -74,6 +76,7 @@ func run() error {
 
 	reg := registry.New(blobs, uploads, meta,
 		registry.WithMaxBlobSize(*maxBlob),
+		registry.WithMaxManifestSize(*maxMani),
 		registry.WithLogger(logger),
 	)
 

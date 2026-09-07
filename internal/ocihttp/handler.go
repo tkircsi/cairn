@@ -1,16 +1,26 @@
-// Package ocihttp serves the blob half of the OCI distribution API.
+// Package ocihttp serves the blob and manifest endpoints of the OCI distribution
+// API.
 //
 // Endpoints implemented, by the spec's own numbering:
 //
 //	end-1   GET    /v2/
 //	end-2   GET    /v2/<name>/blobs/<digest>            (also HEAD, with Range)
+//	end-3   GET    /v2/<name>/manifests/<digest>        (also HEAD)
 //	end-4a  POST   /v2/<name>/blobs/uploads/
 //	end-4b  POST   /v2/<name>/blobs/uploads/?digest=    single-request push
 //	end-5   PATCH  /v2/<name>/blobs/uploads/<ref>       one chunk
 //	end-6   PUT    /v2/<name>/blobs/uploads/<ref>?digest=
+//	end-7   PUT    /v2/<name>/manifests/<digest>
+//	end-9   DELETE /v2/<name>/manifests/<digest>
 //	end-10  DELETE /v2/<name>/blobs/<digest>
 //	end-11  POST   /v2/<name>/blobs/uploads/?mount=&from=
 //	end-13  GET    /v2/<name>/blobs/uploads/<ref>       session status
+//
+// References are digests only. A tag is recognised and refused rather than
+// treated as a missing manifest, so end-3 and end-7 are implemented for their
+// digest form alone.
+//
+// Manifest endpoints live in manifest.go.
 //
 // The handler's whole job is translation: it parses a request into the arguments
 // the registry takes, and turns the registry's outcomes into the status and error
@@ -73,19 +83,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A repository name contains slashes, so the route cannot be split on them.
-	// The last "/blobs" is the separator: a name may legally end in a component
-	// called "blobs", and taking the last occurrence resolves that in favour of
-	// the endpoint, which is what other registries do.
-	marker := strings.LastIndex(rest, "/blobs")
-	if marker < 0 {
+	name, section, tail, ok := splitPath(rest)
+	if !ok {
 		writeError(w, http.StatusNotFound, "UNSUPPORTED", "not a registry endpoint")
 
 		return
 	}
-
-	name := rest[:marker]
-	tail := strings.TrimPrefix(rest[marker+len("/blobs"):], "/")
 
 	if len(name) > maxNameLength || !nameRE.MatchString(name) {
 		writeError(w, http.StatusBadRequest, "NAME_INVALID", "invalid repository name")
@@ -93,6 +96,46 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	switch section {
+	case sectionBlobs:
+		h.blobs(w, r, name, tail)
+	case sectionManifests:
+		h.manifest(w, r, name, tail)
+	}
+}
+
+// Route sections, which are the only path components after a repository name.
+const (
+	sectionBlobs     = "/blobs"
+	sectionManifests = "/manifests"
+)
+
+// splitPath separates a repository name from the endpoint acting on it.
+//
+// A repository name contains slashes, so the route cannot simply be split on
+// them, and a name may legally end in a component called "blobs" or
+// "manifests". Taking the *last* occurrence of a section marker resolves that
+// ambiguity in favour of the endpoint, which is what other registries do; taking
+// the later of the two markers extends the same rule to a name containing both.
+func splitPath(rest string) (name, section, tail string, ok bool) {
+	blobs := strings.LastIndex(rest, sectionBlobs)
+	manifests := strings.LastIndex(rest, sectionManifests)
+
+	marker, at := sectionBlobs, blobs
+
+	if manifests > blobs {
+		marker, at = sectionManifests, manifests
+	}
+
+	if at < 0 {
+		return "", "", "", false
+	}
+
+	return rest[:at], marker, strings.TrimPrefix(rest[at+len(marker):], "/"), true
+}
+
+// blobs routes the blob endpoints beneath a repository.
+func (h *Handler) blobs(w http.ResponseWriter, r *http.Request, name, tail string) {
 	switch {
 	// The spec writes this endpoint with a trailing slash and clients send it
 	// that way, but the slash is not a separator here -- there is no session

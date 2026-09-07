@@ -126,6 +126,28 @@ func errorCode(t *testing.T, resp *http.Response) string {
 	return body.Errors[0].Code
 }
 
+// errorMessage reads the human-readable half of the envelope, for the cases where
+// the message is the thing under test because it is what a client acts on.
+func errorMessage(t *testing.T, resp *http.Response) string {
+	t.Helper()
+
+	var body struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+
+	if len(body.Errors) != 1 {
+		t.Fatalf("got %d errors, want 1", len(body.Errors))
+	}
+
+	return body.Errors[0].Message
+}
+
 // push uploads data in one request and returns its digest.
 func push(t *testing.T, server *httptest.Server, repository string, data []byte, dgst digest.Digest) {
 	t.Helper()

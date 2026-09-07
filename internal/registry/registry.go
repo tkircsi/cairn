@@ -2,9 +2,12 @@
 // index into the operations the HTTP surface calls.
 //
 // This is the only layer that knows the rules: that a digest is verified before
-// content is promoted, that a chunk must be contiguous, and that a blob is
-// readable only from a repository that pushed it. The handler above it is left
-// to translate those outcomes into status codes.
+// content is promoted, that a chunk must be contiguous, that a manifest may not
+// reference content the repository lacks, and that content is readable only from
+// a repository that pushed it. The handler above it is left to translate those
+// outcomes into status codes.
+//
+// Manifest operations live in manifest.go.
 package registry
 
 import (
@@ -35,8 +38,16 @@ var (
 	ErrDigestMismatch = errors.New("digest mismatch")
 	// ErrNotContiguous is a chunk that does not begin where the last one ended.
 	ErrNotContiguous = errors.New("chunk is not contiguous")
-	// ErrTooLarge is an upload that exceeded the configured ceiling.
-	ErrTooLarge = errors.New("upload exceeds the maximum blob size")
+	// ErrTooLarge is content that exceeded the configured ceiling.
+	ErrTooLarge = errors.New("content exceeds the maximum size")
+	// ErrManifestInvalid is a manifest that could not be parsed, or that
+	// contradicts itself or the request that carried it.
+	ErrManifestInvalid = errors.New("manifest invalid")
+	// ErrManifestBlobUnknown is a manifest referencing content the repository
+	// does not hold. Distinct from ErrNotFound because the spec gives it its own
+	// code: the manifest is the thing being rejected, but the *reason* is a
+	// missing child, and a client needs to know which.
+	ErrManifestBlobUnknown = errors.New("manifest references unknown content")
 )
 
 // DefaultMaxBlobSize caps a single blob.
@@ -52,9 +63,10 @@ type Registry struct {
 	uploads uploadstore.Store
 	meta    metastore.Store
 
-	maxBlobSize int64
-	now         func() time.Time
-	log         *slog.Logger
+	maxBlobSize     int64
+	maxManifestSize int64
+	now             func() time.Time
+	log             *slog.Logger
 }
 
 // Option adjusts a Registry.
@@ -63,6 +75,14 @@ type Option func(*Registry)
 // WithMaxBlobSize sets the per-blob ceiling.
 func WithMaxBlobSize(n int64) Option {
 	return func(r *Registry) { r.maxBlobSize = n }
+}
+
+// WithMaxManifestSize sets the per-manifest ceiling.
+//
+// Separate from the blob ceiling because the constraint is different: a blob is
+// streamed to disk, while a manifest is held in memory to be hashed and parsed.
+func WithMaxManifestSize(n int64) Option {
+	return func(r *Registry) { r.maxManifestSize = n }
 }
 
 // WithClock replaces the clock, so tests can assert on timestamps.
@@ -87,12 +107,13 @@ func New(
 	opts ...Option,
 ) *Registry {
 	r := &Registry{
-		blobs:       blobs,
-		uploads:     uploads,
-		meta:        meta,
-		maxBlobSize: DefaultMaxBlobSize,
-		now:         time.Now,
-		log:         slog.Default(),
+		blobs:           blobs,
+		uploads:         uploads,
+		meta:            meta,
+		maxBlobSize:     DefaultMaxBlobSize,
+		maxManifestSize: DefaultMaxManifestSize,
+		now:             time.Now,
+		log:             slog.Default(),
 	}
 
 	for _, opt := range opts {

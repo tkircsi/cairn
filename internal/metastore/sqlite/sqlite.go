@@ -32,6 +32,32 @@ CREATE TABLE IF NOT EXISTS blobs (
 -- cross-repository mount asks and what a garbage collector would need.
 CREATE INDEX IF NOT EXISTS blobs_by_digest ON blobs (digest);
 
+CREATE TABLE IF NOT EXISTS manifests (
+    repository    TEXT    NOT NULL,
+    digest        TEXT    NOT NULL,
+    media_type    TEXT    NOT NULL,
+    -- Empty string rather than NULL, so scanning needs no sql.NullString and the
+    -- Go zero value round-trips. digest.Digest("") is already the natural "none".
+    artifact_type TEXT    NOT NULL DEFAULT '',
+    subject       TEXT    NOT NULL DEFAULT '',
+    size          INTEGER NOT NULL,
+    created_at    TEXT    NOT NULL,
+    PRIMARY KEY (repository, digest)
+) WITHOUT ROWID;
+
+-- The primary key is clustered on (repository, digest), so it cannot answer a
+-- query on digest alone -- and "does anything still reference these bytes" is
+-- exactly that query. Without this index a garbage collector's liveness check
+-- degrades into a full scan of the table per file it considers.
+CREATE INDEX IF NOT EXISTS manifests_by_digest ON manifests (digest);
+
+-- No index on subject yet, deliberately. It would serve only the referrers
+-- endpoint, which does not exist, and until then it is write amplification on
+-- every push. The asymmetry that decides this: CREATE INDEX IF NOT EXISTS is
+-- free to add later because this schema is reapplied on open, whereas adding a
+-- *column* later would need an ALTER and a backfill that nothing here performs.
+-- So the columns land now and the index waits.
+
 CREATE TABLE IF NOT EXISTS uploads (
     id         TEXT    NOT NULL PRIMARY KEY,
     repository TEXT    NOT NULL,
@@ -126,6 +152,70 @@ func (s *Store) DeleteBlob(ctx context.Context, repository string, dgst digest.D
 	return s.execExpectingRow(ctx, query, repository, dgst.String())
 }
 
+func (s *Store) PutManifest(ctx context.Context, m model.Manifest) error {
+	const query = `
+INSERT INTO manifests (repository, digest, media_type, artifact_type, subject, size, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (repository, digest) DO NOTHING`
+
+	_, err := s.db.ExecContext(ctx, query,
+		m.Repository, m.Digest.String(), m.MediaType, m.ArtifactType,
+		m.Subject.String(), m.Size, formatTime(m.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert manifest: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) Manifest(
+	ctx context.Context,
+	repository string,
+	dgst digest.Digest,
+) (model.Manifest, error) {
+	const query = `
+SELECT repository, digest, media_type, artifact_type, subject, size, created_at
+FROM manifests
+WHERE repository = ? AND digest = ?`
+
+	var (
+		m         model.Manifest
+		dgstText  string
+		subject   string
+		createdAt string
+	)
+
+	err := s.db.QueryRowContext(ctx, query, repository, dgst.String()).Scan(
+		&m.Repository, &dgstText, &m.MediaType, &m.ArtifactType,
+		&subject, &m.Size, &createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Manifest{}, metastore.ErrNotFound
+	}
+
+	if err != nil {
+		return model.Manifest{}, fmt.Errorf("scan manifest: %w", err)
+	}
+
+	m.Digest = digest.Digest(dgstText)
+	m.Subject = digest.Digest(subject)
+
+	if m.CreatedAt, err = parseTime(createdAt); err != nil {
+		return model.Manifest{}, err
+	}
+
+	return m, nil
+}
+
+func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error {
+	// As with a blob, only the row goes: the bytes may be referenced by an index
+	// in another repository, and nothing here decides last-reference.
+	const query = `DELETE FROM manifests WHERE repository = ? AND digest = ?`
+
+	return s.execExpectingRow(ctx, query, repository, dgst.String())
+}
+
 func (s *Store) CreateUpload(ctx context.Context, u model.Upload) error {
 	const query = `
 INSERT INTO uploads (id, repository, received, started_at, updated_at)
@@ -184,6 +274,30 @@ func (s *Store) DeleteUpload(ctx context.Context, id string) error {
 	const query = `DELETE FROM uploads WHERE id = ?`
 
 	return s.execExpectingRow(ctx, query, id)
+}
+
+func (s *Store) IsReferenced(ctx context.Context, dgst digest.Digest) (bool, error) {
+	// Both halves are index seeks: blobs_by_digest and manifests_by_digest exist for
+	// this query, since neither primary key is usable on digest alone.
+	//
+	// UNION ALL rather than UNION: EXISTS stops at the first row, so deduplicating
+	// the two sides would be work whose result is discarded.
+	const query = `
+SELECT EXISTS (
+    SELECT 1 FROM blobs     WHERE digest = ?
+    UNION ALL
+    SELECT 1 FROM manifests WHERE digest = ?
+)`
+
+	var referenced bool
+
+	text := dgst.String()
+
+	if err := s.db.QueryRowContext(ctx, query, text, text).Scan(&referenced); err != nil {
+		return false, fmt.Errorf("check references to %s: %w", dgst, err)
+	}
+
+	return referenced, nil
 }
 
 // execExpectingRow runs a statement that must affect exactly one row, reporting
