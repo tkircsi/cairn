@@ -37,8 +37,8 @@ readonly REPEATS="${REPEATS:-5}"
 readonly OUT="${OUT:-$ROOT/bench/results}"
 readonly WORK="$ROOT/.bench"
 
-# Pinned, and both already local. Zot v2.1.20 is the version the production
-# investigation ran against; Distribution 3.1.1 is the current v3.
+# Pinned, and both already local. Zot v2.1.20 and Distribution 3.1.1 match
+# the versions in bench/README.md.
 readonly ZOT_IMAGE="ghcr.io/project-zot/zot-linux-arm64:v2.1.20"
 readonly DIST_IMAGE="registry:3.1.1"
 

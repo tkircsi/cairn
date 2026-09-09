@@ -6,3 +6,5 @@ conformance-report/
 /.bench/
 /bench/results/*.log
 .DS_Store
+.env
+.env.local

@@ -14,7 +14,7 @@ ARMS="8 32 64" ./scripts/concurrency.sh cairn
 
 This reproduces a test from the registry evaluation that preceded cairn, where
 Distribution lost referrers silently. `oras attach` is the client, deliberately: it is
-the same `oras-go` path Directory's `PushReferrer` uses, and it chooses the native or
+the same `oras-go` path a typical referrer client uses, and it chooses the native or
 fallback route by itself. The original arms — 6 serial, then 2/4/6/8 concurrent — are
 kept verbatim, with higher ones added.
 
@@ -82,104 +82,6 @@ and the reason existed nowhere. The cause now rides on the response recorder int
 existing log record, so a failed request is still one line, and the client's response is
 unchanged.
 
-# Real production data
-
-Two questions, both answered with a real Directory repository, and they need different
-setups because one of them is about interoperability and the other about speed.
-
-## Is cairn a usable mirror target? (regsync)
-
-```sh
-./scripts/regsync.sh              # sample of 300 records
-MEASURE_ONLY=1 ./scripts/regsync.sh 300   # re-time without re-transferring
-```
-
-regsync is regclient, an independent implementation of the same spec, and it is the tool
-Directory's own migration job runs. The config this script generates mirrors that job's:
-`parallel`, `digestTags: false`, `referrers: true`. The last one matters — with referrers
-off, a record arrives without its signature and the mirror is quietly incomplete.
-
-Verification does not trust regsync's exit code, because that reports what was attempted.
-Every record is re-read from both registries and compared on digest and on the set of
-referrer digests attached to it.
-
-**Result: 40/40 records mirrored, 182 referrers, zero missing, zero digest mismatches, zero
-referrer gaps.** cairn accepted everything regclient sent, including manifests whose config
-descriptor carries inlined `data` — regsync pushes that blob explicitly, so cairn's
-requirement that referenced blobs exist is satisfied.
-
-What this script cannot do is produce a fair timing comparison, for a reason worth
-recording: regsync asks the source "what refers to this record?" once per record, and on
-the source that costs ~560 ms, so the mirror is throttled by the very lookup under test.
-A full mirror projects to hours and raising `parallel` from 4 to 16 changed throughput not
-at all. The measurement below therefore does not use regsync.
-
-## How fast is each registry on identical content? (the clone)
-
-```sh
-# load a byte-faithful on-disk clone of production into cairn
-./scripts/load_oci_layout.py <clone>/dir 127.0.0.1:5090 dir
-
-# time both registries on it, checking answers against the layout
-./scripts/compare_registries.py --layout <clone>/dir --repo dir \
-    --registry cairn=127.0.0.1:5090 --registry zot=127.0.0.1:5091
-```
-
-This is the measurement the earlier registry evaluation left unfinished. That work timed a
-referrer lookup at ~6–8 s on a production Zot clone and 2 ms on Distribution, but the
-second number came from a tag-addressed index clients had already built, so the two were
-not answering the same question the same way — and cairn had no number at all.
-
-Here both registries hold **the same 28,788 manifests from the same clone**, both are on
-loopback, and both are asked through the referrers API. No baseline correction, no
-content-volume gap, no client-built fallback index.
-
-Loading reads the layout off disk instead of mirroring, which is what makes it practical:
-a referrer is just a manifest with a subject, so the graph is already in the bytes, and
-cairn builds its index as a side effect of ordinary pushes. No referrer lookup happens on
-either side. **28,788 manifests and 28,796 blobs in 210 s, zero failures**, against the
-36 hours regsync projected for the same data.
-
-Ground truth comes from the layout rather than from either registry, because a fast wrong
-answer is not an improvement:
-
-```
-records                                            2890
-referrer manifests                                25898
-distinct subjects referenced                       6615
-records that have referrers                        2843
-referrers whose subject no longer exists (orphaned) 14906
-```
-
-Those orphans are the point. They are more than half the referrers, their subjects were
-deleted in production, and they are still tagged — so they are still scanned on every
-lookup that walks the repository.
-
-### Results
-
-15 records sampled evenly across the repository, median of 3 reads:
-
-| | cairn | Zot | ratio |
-|---|---|---|---|
-| referrer lookup | **0.43 ms** | 6642 ms | **15,411x** |
-| manifest by tag | 0.79 ms | 32.5 ms | 41x |
-| tag list (28,780 tags) | 11.9 ms | 42.0 ms | 3.5x |
-
-**Every registry's referrer set matched the layout exactly.** Both are correct; they differ
-only in what they do to get there. cairn reads an indexed row. Zot walks the repository
-index and parses manifests to check subjects, so its cost scales with everything stored —
-including the 14,906 orphans, none of which can match.
-
-Two sanity checks on the harness rather than the registries. Zot's 6.6 s reproduces the
-5,983 ms the earlier evaluation measured on this same clone, so the setup is consistent
-with prior work. And cairn's 0.43 ms at 28,788 manifests matches its 0.49 ms at 40 — the
-flatness under accumulation the synthetic benchmark below predicts, now confirmed on real
-data three orders of magnitude larger.
-
-One honest note on the load: throughput drifted from 160/s to 137/s across the run, a 14%
-decline as the index grew. Small, but it is not perfectly flat and it is measured here
-rather than assumed.
-
 # Referrers under accumulation
 
 cairn keeps an SQL index for one reason: "what refers to this manifest" is not
@@ -191,8 +93,8 @@ asserted.
 Run it:
 
 ```sh
-./scripts/bench-referrers.sh                # all three, 3000 referrers
-N=500 ./scripts/bench-referrers.sh cairn    # one arm, shorter
+./scripts/bench-referrers.sh                      # all three, default N=2000
+N=3000 EVERY=100 ./scripts/bench-referrers.sh     # matching the tables below
 ```
 
 Results land in `bench/results/<registry>.csv`, one row per sample point.
@@ -301,8 +203,8 @@ move.
 `index.json`**, which by then holds an entry per referrer. Its unrelated `HEAD` getting
 3.5× slower is the same cause seen from the other side, and it is the more damaging
 result: the cost does not stay inside the feature that caused it. That is the mechanism
-behind the 5–6 second reads in the original production investigation, reproduced at 3000
-referrers on a laptop against a repository that held ~27,000 tags in production.
+behind the multi-second reads that motivated this work, reproduced at 3000 referrers
+on a laptop.
 
 Worth being clear that this is Zot at its best on this workload. Dedupe is off and no
 extensions are configured, so neither the startup dedupe walk

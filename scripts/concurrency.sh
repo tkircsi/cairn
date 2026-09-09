@@ -15,9 +15,10 @@
 # -- the interesting question for cairn is not whether it passes at 8 but where it stops
 # passing, and whether the failure is loud when it comes.
 #
-# oras attach is the client, deliberately: it is the same oras-go path Directory's
-# PushReferrer uses, and it picks the native or fallback route by itself. Reproducing
-# the test with a bespoke client would prove something about the client instead.
+# oras attach is the client, deliberately: it is the same oras-go path a typical
+# referrer client uses, and it picks the native or fallback route by itself.
+# Reproducing the test with a bespoke client would prove something about the client
+# instead.
 #
 # Usage:
 #   ./scripts/concurrency.sh                    all three registries
