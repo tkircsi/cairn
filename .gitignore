@@ -4,6 +4,7 @@
 .conformance/
 conformance-report/
 /.bench/
+/.notes/
 /bench/results/*.log
 .DS_Store
 .env
