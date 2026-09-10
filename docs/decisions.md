@@ -217,6 +217,24 @@ re-pushing content it still has, which is the cheapest kind of loss available �
 and the reason the default is worth trading away here but would not be in a
 system whose writes cannot be reconstructed by their author.
 
+**A contended write is a 503, not a 500.** `SQLITE_BUSY` is the store saying someone
+else held the lock. Nothing was wrong with the request and sending it again is the
+entire remedy, so reporting it as an internal fault is wrong twice: it claims the
+registry broke when it did not, and `UNSUPPORTED` tells the client that retrying is
+pointless. `oras` and containerd both honour `503` with `Retry-After`, which makes
+this the difference between a push that recovers by itself and one that fails in
+front of someone.
+
+The classification masks SQLite's result code to its low byte, because the extended
+codes — `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT` — do not compare equal to
+`SQLITE_BUSY`, and missing one reproduces the exact bug this fixes. Being *too* eager
+is the worse direction, though: 503 is an instruction to try again, so a permanent
+failure wearing it becomes a client retrying forever. Both directions have a test.
+
+The detail still goes only to the log. The wrapped error carries SQL text, and the
+result code is what lets an operator tell real contention from anything else that
+might answer with this status.
+
 **Content-Type must agree with the document's `mediaType`.** Both describe the
 same bytes, and which one a proxy or cache downstream believes is not knowable
 from here, so a disagreement is refused instead of silently resolved in favour of

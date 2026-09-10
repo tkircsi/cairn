@@ -5,12 +5,14 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/opencontainers/go-digest"
 
+	"github.com/tkircsi/cairn/internal/metastore"
 	"github.com/tkircsi/cairn/internal/model"
 )
 
@@ -36,7 +38,7 @@ import (
 func TestPragmasHoldOnEveryConnection(t *testing.T) {
 	t.Parallel()
 
-	db, err := sql.Open("sqlite", dsn(filepath.Join(t.TempDir(), "cairn.db")))
+	db, err := sql.Open("sqlite", dsn(filepath.Join(t.TempDir(), "cairn.db"), pragmas))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -252,6 +254,128 @@ func TestConcurrentPutBlobIsIdempotent(t *testing.T) {
 	if got.Size != blob.Size {
 		t.Errorf("size = %d, want %d", got.Size, blob.Size)
 	}
+}
+
+// TestContendedWriteIsReportedAsBusy pins the classification the HTTP layer depends on.
+//
+// SQLITE_BUSY means the request was fine and someone else had the lock, so a client
+// that retries succeeds. Reported as a generic write failure it becomes a 500, which
+// tells that client the opposite, and the registry claims an internal fault for
+// something it could have queued.
+//
+// The lock is taken from a second database handle rather than a second goroutine,
+// because with the pool capped at one connection the store cannot contend with itself.
+// What it can still contend with is another process on the same data root -- a second
+// cairnd, or a backup reading the file -- which is what this reproduces.
+func TestContendedWriteIsReportedAsBusy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cairn.db")
+
+	// Long enough that the wait is real, short enough that the test does not spend the
+	// production five seconds proving it.
+	store, err := openWith(ctx, path, withBusyTimeout(pragmas, "busy_timeout(100)"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	t.Cleanup(func() { store.Close() })
+
+	blocker, err := sql.Open("sqlite", dsn(path, pragmas))
+	if err != nil {
+		t.Fatalf("open blocker: %v", err)
+	}
+
+	t.Cleanup(func() { blocker.Close() })
+
+	tx, err := blocker.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	defer tx.Rollback() //nolint:errcheck // the lock is released either way
+
+	// A bare BEGIN is deferred in SQLite and takes no write lock until something
+	// writes, so the transaction has to actually insert to hold the lock this test
+	// needs held.
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO blobs (repository, digest, size, created_at) VALUES ('acme/widgets', 'sha256:x', 1, '')`,
+	); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+
+	err = store.PutBlob(ctx, model.Blob{
+		Repository: "acme/widgets",
+		Digest:     digest.FromString("contended"),
+		Size:       9,
+		CreatedAt:  time.Unix(1700000000, 0).UTC(),
+	})
+
+	if err == nil {
+		t.Fatal("PutBlob succeeded against a held write lock")
+	}
+
+	if !errors.Is(err, metastore.ErrBusy) {
+		t.Errorf("error is not ErrBusy, so the handler answers 500 and the client "+
+			"gives up on a request it should retry: %v", err)
+	}
+
+	// The sentinel is wrapped, not substituted. An operator needs the result code to
+	// tell real contention from anything else that ends up wearing this status.
+	if !strings.Contains(err.Error(), "SQLITE_BUSY") {
+		t.Errorf("error lost the driver's message, so the log cannot show why: %v", err)
+	}
+}
+
+// TestPermanentWriteFailureIsNotBusy is the other half, and the more important one.
+//
+// A classification that says yes too often is worse than none: answering 503 to a
+// permanent failure has the client retry a request that can never succeed. A duplicate
+// upload id violates the primary key, which no amount of retrying fixes.
+func TestPermanentWriteFailureIsNotBusy(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store := open(t)
+
+	upload := model.Upload{
+		ID:         "1c8b4c4e-0e2a-4d0f-9b3a-2f6d8c1e5a70",
+		Repository: "acme/widgets",
+		StartedAt:  time.Unix(1700000000, 0).UTC(),
+		UpdatedAt:  time.Unix(1700000000, 0).UTC(),
+	}
+
+	if err := store.CreateUpload(ctx, upload); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+
+	err := store.CreateUpload(ctx, upload)
+	if err == nil {
+		t.Fatal("duplicate upload id was accepted")
+	}
+
+	if errors.Is(err, metastore.ErrBusy) {
+		t.Errorf("constraint violation classified as contention, so the client is told "+
+			"to retry something that cannot succeed: %v", err)
+	}
+}
+
+// withBusyTimeout replaces the busy_timeout entry, leaving the rest of the pragmas
+// exactly as production runs them. Building a short list by hand would let this test
+// drift away from the configuration it is meant to be testing.
+func withBusyTimeout(base []string, replacement string) []string {
+	out := make([]string, 0, len(base))
+
+	for _, pragma := range base {
+		if strings.HasPrefix(pragma, "busy_timeout(") {
+			pragma = replacement
+		}
+
+		out = append(out, pragma)
+	}
+
+	return out
 }
 
 // open is a fresh store on disk. Not :memory:, because an in-memory database is

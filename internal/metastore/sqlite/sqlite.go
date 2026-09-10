@@ -17,7 +17,8 @@ import (
 	"github.com/tkircsi/cairn/internal/metastore"
 	"github.com/tkircsi/cairn/internal/model"
 
-	_ "modernc.org/sqlite" // pure-Go driver, so no cgo
+	sqlitedriver "modernc.org/sqlite" // pure-Go driver, so no cgo
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const schema = `
@@ -147,7 +148,7 @@ type Store struct {
 // Built as a URI so the path is escaped rather than trusted to contain no character the
 // query parser cares about: a temporary directory or a data root with a "?" in it would
 // otherwise have part of its name read as settings.
-func dsn(path string) string {
+func dsn(path string, pragmas []string) string {
 	query := make(url.Values, len(pragmas))
 	for _, pragma := range pragmas {
 		query.Add("_pragma", pragma)
@@ -210,7 +211,17 @@ var pragmas = []string{
 
 // Open opens (creating if needed) the database at path.
 func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", dsn(path))
+	return openWith(ctx, path, pragmas)
+}
+
+// openWith is Open with the connection pragmas supplied by the caller.
+//
+// It exists for one test, which needs a store whose busy_timeout is short enough to
+// observe contention without spending the production five seconds on it. Unexported,
+// because the pragmas are not a knob: every one of them is load-bearing and the reasons
+// are recorded above the list.
+func openWith(ctx context.Context, path string, pragmas []string) (*Store, error) {
+	db, err := sql.Open("sqlite", dsn(path, pragmas))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -338,7 +349,7 @@ ON CONFLICT (repository, digest) DO NOTHING`
 		b.Repository, b.Digest.String(), b.Size, formatTime(b.CreatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("insert blob: %w", err)
+		return writeErr("insert blob", err)
 	}
 
 	return nil
@@ -392,7 +403,7 @@ ON CONFLICT (repository, digest) DO NOTHING`
 		m.Subject.String(), annotations, m.Size, formatTime(m.CreatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("insert manifest: %w", err)
+		return writeErr("insert manifest", err)
 	}
 
 	return nil
@@ -556,7 +567,7 @@ func scanManifest(row interface{ Scan(...any) error }) (model.Manifest, error) {
 func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst digest.Digest) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return writeErr("begin", err)
 	}
 
 	// Rollback after a successful Commit is a no-op, so this needs no flag.
@@ -565,7 +576,7 @@ func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst dige
 	const dropTags = `DELETE FROM tags WHERE repository = ? AND digest = ?`
 
 	if _, err := tx.ExecContext(ctx, dropTags, repository, dgst.String()); err != nil {
-		return fmt.Errorf("delete tags for manifest: %w", err)
+		return writeErr("delete tags for manifest", err)
 	}
 
 	// As with a blob, only the row goes: the bytes may be referenced by an index
@@ -574,7 +585,7 @@ func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst dige
 
 	result, err := tx.ExecContext(ctx, dropManifest, repository, dgst.String())
 	if err != nil {
-		return fmt.Errorf("delete manifest: %w", err)
+		return writeErr("delete manifest", err)
 	}
 
 	affected, err := result.RowsAffected()
@@ -589,7 +600,7 @@ func (s *Store) DeleteManifest(ctx context.Context, repository string, dgst dige
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return writeErr("commit", err)
 	}
 
 	return nil
@@ -609,7 +620,7 @@ ON CONFLICT (repository, name) DO UPDATE SET
 		t.Repository, t.Name, t.Digest.String(), formatTime(t.UpdatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("upsert tag: %w", err)
+		return writeErr("upsert tag", err)
 	}
 
 	return nil
@@ -757,7 +768,7 @@ VALUES (?, ?, ?, ?, ?)`
 		u.ID, u.Repository, u.Received, formatTime(u.StartedAt), formatTime(u.UpdatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("insert upload: %w", err)
+		return writeErr("insert upload", err)
 	}
 
 	return nil
@@ -836,6 +847,50 @@ SELECT EXISTS (
 	return referenced, nil
 }
 
+// writeErr annotates a failed write with the operation that failed, and marks lock
+// contention as metastore.ErrBusy so the HTTP layer can answer 503 rather than 500.
+//
+// Both are wrapped, which is what lets errors.Is find the sentinel while the driver's
+// own message -- carrying the result code -- still reaches the access log.
+//
+// Only writes go through this. A read can in principle be refused the same way, but
+// with the pool capped at one connection the readers here queue behind the writer
+// rather than race it, so a read that returned SQLITE_BUSY would mean something other
+// than contention and should not be quietly labelled retryable.
+func writeErr(op string, err error) error {
+	if contended(err) {
+		return fmt.Errorf("%s: %w: %w", op, metastore.ErrBusy, err)
+	}
+
+	return fmt.Errorf("%s: %w", op, err)
+}
+
+// contended reports whether err is SQLite declining to proceed because someone else
+// holds the lock, rather than anything being wrong with the statement.
+//
+// The result code is masked to its low byte before comparison. SQLite reports variants
+// of a condition by packing a subcode into the high bits -- SQLITE_BUSY_SNAPSHOT is
+// 517 and SQLITE_BUSY_TIMEOUT is 773, neither equal to SQLITE_BUSY -- so testing the
+// whole value silently misses them, and a miss here looks exactly like the bug this
+// function exists to fix: a retryable condition reported as an internal error.
+//
+// SQLITE_LOCKED is the same condition between two connections to one database rather
+// than between two database handles. It is included because the remedy is identical
+// and the caller cannot act on the difference.
+func contended(err error) bool {
+	var sqliteErr *sqlitedriver.Error
+	if !errors.As(err, &sqliteErr) {
+		return false
+	}
+
+	switch sqliteErr.Code() & 0xff {
+	case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
+		return true
+	default:
+		return false
+	}
+}
+
 // execExpectingRow runs a statement that must affect exactly one row, reporting
 // ErrNotFound when it affects none. Without this, deleting a session that does
 // not exist would look like success and the caller could not answer
@@ -843,7 +898,7 @@ SELECT EXISTS (
 func (s *Store) execExpectingRow(ctx context.Context, query string, args ...any) error {
 	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
-		return fmt.Errorf("exec: %w", err)
+		return writeErr("exec", err)
 	}
 
 	affected, err := result.RowsAffected()
