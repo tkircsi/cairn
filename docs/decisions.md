@@ -197,6 +197,26 @@ instead of capping the pool. It also makes one bug possible that was not before:
 holding a transaction open while issuing another query on `s.db` now deadlocks,
 because the transaction owns the only connection.
 
+**The WAL is not flushed to disk on every commit.** SQLite defaults to
+`synchronous=FULL`, which fsyncs the write-ahead log at each commit — for a
+registry that is a device flush per blob row, per manifest row and per
+upload-offset update, and on macOS it is `F_FULLFSYNC`, which genuinely waits for
+the hardware. cairn runs `synchronous=NORMAL`, which is the standard setting for
+WAL mode and was worth 39% of write throughput on its own.
+
+What that gives up is narrower than "less durable" suggests. In WAL mode NORMAL
+still survives a process crash, because the WAL is an ordinary file and the
+operating system holds the bytes — killing `cairnd` loses nothing. Power loss or a
+kernel panic can cost the last few committed transactions, whose bytes may still
+be in the page cache.
+
+What it cannot do is corrupt the database. WAL frames are checksummed and recovery
+stops at the first torn one, so the failure mode is losing the tail of recent
+history rather than an unreadable file. For a registry that means a client
+re-pushing content it still has, which is the cheapest kind of loss available —
+and the reason the default is worth trading away here but would not be in a
+system whose writes cannot be reconstructed by their author.
+
 **Content-Type must agree with the document's `mediaType`.** Both describe the
 same bytes, and which one a proxy or cache downstream believes is not knowable
 from here, so a disagreement is refused instead of silently resolved in favour of

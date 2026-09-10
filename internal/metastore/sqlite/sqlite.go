@@ -185,6 +185,23 @@ var pragmas = []string{
 	// promised to remove.
 	"foreign_keys(1)",
 	"journal_mode(WAL)",
+	// Do not fsync the WAL on every commit. Unset, SQLite defaults to FULL and does,
+	// which for a registry means a device flush per blob row, per manifest row and per
+	// upload-offset update -- and on macOS that is F_FULLFSYNC, which really does wait
+	// for the platter. Measured at 32 concurrent writers, NORMAL is worth +39% on its
+	// own (127 -> 176 writes/s) and 221 alongside the single write connection.
+	//
+	// What is given up is bounded and worth stating exactly, because "less durable"
+	// invites the wrong guess. In WAL mode NORMAL still survives a process crash: the
+	// WAL is a real file and the operating system has the bytes, so a killed cairnd
+	// loses nothing. It is power loss and kernel panic that can cost the last few
+	// committed transactions, because those bytes may still be in the page cache.
+	//
+	// What it cannot do is corrupt the database. WAL frames are checksummed and a
+	// recovering reader stops at the first torn one, so the failure mode is losing the
+	// tail of recent history, not an unreadable file. For a registry that is a client
+	// re-pushing content it can reproduce from its own disk.
+	"synchronous(NORMAL)",
 	// Bounds how much of an index ANALYZE will read, so gathering statistics stays
 	// proportional to nothing in particular rather than to the size of the database.
 	// SQLite's own recommended value.

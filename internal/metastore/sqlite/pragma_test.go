@@ -54,6 +54,7 @@ func TestPragmasHoldOnEveryConnection(t *testing.T) {
 	type conn struct {
 		busyTimeout int
 		foreignKeys int
+		synchronous int
 	}
 
 	var (
@@ -91,6 +92,10 @@ func TestPragmasHoldOnEveryConnection(t *testing.T) {
 				t.Error(err)
 			}
 
+			if err := tx.QueryRow("PRAGMA synchronous").Scan(&c.synchronous); err != nil {
+				t.Error(err)
+			}
+
 			mu.Lock()
 			seen = append(seen, c)
 			mu.Unlock()
@@ -115,6 +120,14 @@ func TestPragmasHoldOnEveryConnection(t *testing.T) {
 		if c.foreignKeys != 1 {
 			t.Errorf("connection %d has foreign_keys off: the schema's cascades are "+
 				"silently not enforced on it", i)
+		}
+
+		// 1 is NORMAL, 2 is FULL. Asserted by value rather than "not FULL" because
+		// this is also the check that the DSN spelling reaches SQLite at all -- a
+		// pragma the driver silently ignored would leave the default of 2 here.
+		if c.synchronous != 1 {
+			t.Errorf("connection %d has synchronous = %d, want 1 (NORMAL): the WAL is "+
+				"being fsynced on every commit", i, c.synchronous)
 		}
 	}
 }
