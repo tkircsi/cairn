@@ -51,6 +51,19 @@ var (
 	// ErrTagInvalid is a tag that does not match the spec's grammar, whether it
 	// arrived as a reference, a ?tag= parameter or a pagination cursor.
 	ErrTagInvalid = errors.New("tag invalid")
+	// ErrBusy is the metastore refusing a write because another writer holds the
+	// lock. The request was valid and retrying it is the remedy, which is why the
+	// HTTP layer owes it a 503 rather than a 500.
+	//
+	// Aliased rather than translated at each call site, and that is the honest
+	// shape. Every other name here is an outcome this layer *decided* -- a digest
+	// that did not match, a chunk that did not fit -- and each is produced at the
+	// single place that decided it. Contention is not decided anywhere: it passes
+	// through unchanged from storage and can surface from any of a dozen write
+	// calls, so re-wrapping it at all of them would add a translation step with no
+	// judgement in it and one more place to forget. The name lives here so the
+	// handler above keeps a single vocabulary.
+	ErrBusy = metastore.ErrBusy
 )
 
 // DefaultMaxBlobSize caps a single blob.

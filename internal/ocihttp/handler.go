@@ -537,8 +537,17 @@ type faultRecorder interface {
 	recordFault(error)
 }
 
-// writeServerError reports a fault to the client without describing it, and to the log
-// with the description.
+// retryAfterBusy is how long a client is told to wait before retrying a contended
+// write, in seconds.
+//
+// One second, against a measured p99 of roughly 300ms for the write itself. Erring
+// long rather than short on purpose: the reason the registry is busy is that too much
+// is arriving at once, and a Retry-After that expires before the queue drains turns
+// one contended write into a client that returns immediately to contend again.
+const retryAfterBusy = "1"
+
+// writeServerError reports a server-side failure to the client without describing it,
+// and to the log with the description.
 //
 // The detail goes nowhere a client can see: an internal error message can carry
 // filesystem paths or SQL text, and a caller can do nothing with either. But discarding
@@ -546,9 +555,29 @@ type faultRecorder interface {
 // anywhere -- the access log records that the request failed and the reason is gone. That
 // cost real time: an ordinary `oras push` was failing on a concurrent write, and the only
 // evidence was a status code.
+//
+// Contention is the one case that leaves here as something other than a 500, and every
+// path that can hit it funnels through this function, which is why the check lives here
+// rather than at each caller.
 func writeServerError(w http.ResponseWriter, err error) {
 	if recorder, ok := w.(faultRecorder); ok {
 		recorder.recordFault(err)
+	}
+
+	// A 500 would be wrong twice over. It says the registry broke, when nothing did and
+	// the request was entirely valid; and UNSUPPORTED tells the client that retrying is
+	// pointless, when retrying is the whole remedy. oras and containerd both honour 503
+	// with Retry-After, so this is the difference between a push that recovers on its
+	// own and one that fails in front of someone.
+	//
+	// The cause is still recorded above, so the log keeps the SQLite result code that
+	// distinguishes real contention from something merely wearing its status code.
+	if errors.Is(err, registry.ErrBusy) {
+		w.Header().Set("Retry-After", retryAfterBusy)
+		writeError(w, http.StatusServiceUnavailable, "TOOMANYREQUESTS",
+			"the registry is busy, retry the request")
+
+		return
 	}
 
 	writeError(w, http.StatusInternalServerError, "UNSUPPORTED", "internal error")

@@ -3,6 +3,7 @@ package ocihttp_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,6 +36,16 @@ const helloDigest = digest.Digest("sha256:0da5290841b9d348bcd992cdae451553b669f4
 func newServer(t *testing.T, opts ...registry.Option) *httptest.Server {
 	t.Helper()
 
+	server, _ := newServerAt(t, opts...)
+
+	return server
+}
+
+// newServerAt is newServer with the data root returned, for the one test that has to
+// reach past the handler and take a lock on the database underneath it.
+func newServerAt(t *testing.T, opts ...registry.Option) (*httptest.Server, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 
 	blobs, err := blobstore.NewFS(filepath.Join(dir, "blobs"))
@@ -62,7 +73,76 @@ func newServer(t *testing.T, opts ...registry.Option) *httptest.Server {
 	server := httptest.NewServer(ocihttp.NewHandler(registry.New(blobs, uploads, meta, opts...)))
 	t.Cleanup(server.Close)
 
-	return server
+	return server, dir
+}
+
+// TestContendedWriteAnswers503 drives the whole path, and it is the only test that does.
+//
+// The pieces are covered separately -- the store labels SQLITE_BUSY as ErrBusy, and
+// writeServerError turns ErrBusy into a 503 -- but the interesting failure is between
+// them. The sentinel crosses the registry by being wrapped rather than named, so any
+// layer that replaces an error instead of wrapping it breaks this silently: both unit
+// tests still pass and every contended write goes back to being a 500.
+//
+// It costs the full busy_timeout, five seconds, because that timeout is what the daemon
+// actually runs and reaching this path means waiting it out. That is the price of
+// testing the configuration rather than a convenient version of it.
+func TestContendedWriteAnswers503(t *testing.T) {
+	t.Parallel()
+
+	server, dir := newServerAt(t)
+
+	// A second handle on the same file. With the daemon's pool capped at one connection
+	// it cannot contend with itself, so the contention has to come from outside -- as it
+	// would from a second cairnd on one data root, or a backup reading the database.
+	blocker, err := sql.Open("sqlite", filepath.Join(dir, "cairn.db"))
+	if err != nil {
+		t.Fatalf("open blocker: %v", err)
+	}
+
+	t.Cleanup(func() { blocker.Close() })
+
+	tx, err := blocker.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	defer tx.Rollback() //nolint:errcheck // the lock goes either way
+
+	// A bare BEGIN is deferred in SQLite and holds no write lock until something writes.
+	if _, err := tx.Exec(`INSERT INTO blobs (repository, digest, size, created_at)
+	    VALUES ('lock/holder', 'sha256:lock', 1, '')`); err != nil {
+		t.Fatalf("take the write lock: %v", err)
+	}
+
+	// Starting an upload is the cheapest write to contend: one INSERT, one request, no
+	// body.
+	resp := do(t, server, http.MethodPost, "/v2/"+repo+"/blobs/uploads/", nil, nil)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503: the client is being told to give up on a "+
+			"request that would succeed once the lock clears", resp.StatusCode)
+	}
+
+	if got := resp.Header.Get("Retry-After"); got == "" {
+		t.Error("no Retry-After, so a client has no interval to wait and either " +
+			"retries immediately or not at all")
+	}
+
+	if got := errorCode(t, resp); got != "TOOMANYREQUESTS" {
+		t.Errorf("code = %q, want TOOMANYREQUESTS", got)
+	}
+
+	// And the registry recovers by itself, which is the claim Retry-After makes.
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("release the lock: %v", err)
+	}
+
+	resp = do(t, server, http.MethodPost, "/v2/"+repo+"/blobs/uploads/", nil, nil)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status = %d after the lock cleared, want 202: the 503 was not "+
+			"transient after all", resp.StatusCode)
+	}
 }
 
 func fixture(t *testing.T, name string) ([]byte, digest.Digest) {

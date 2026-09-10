@@ -181,6 +181,60 @@ Each migration asks the schema whether it has already been applied rather than
 consulting a recorded version, because a version number can drift out of step with
 the database it claims to describe.
 
+**Every write goes through one connection, on purpose.** SQLite has a single write
+lock, so a pool of thirty-two connections does not write in parallel — it decides
+how many goroutines contend for that lock. Contending has a price: the loser waits
+inside SQLite's busy handler, which retries with backoff rather than queueing, so
+the wait is unfair and requests that were entirely valid start failing once its
+tail crosses `busy_timeout`. `database/sql` hands connections out FIFO, so capping
+the pool at one turns that race into a queue.
+
+It is a throughput decision, not a cautious one — the concurrency was never buying
+parallelism, only spending it on backoff. The cost is that reads serialise onto the
+same connection, which gives up the concurrent readers WAL exists to provide, and
+that is the reason to eventually queue writes at `PutBlob` and `PutManifest`
+instead of capping the pool. It also makes one bug possible that was not before:
+holding a transaction open while issuing another query on `s.db` now deadlocks,
+because the transaction owns the only connection.
+
+**The WAL is not flushed to disk on every commit.** SQLite defaults to
+`synchronous=FULL`, which fsyncs the write-ahead log at each commit — for a
+registry that is a device flush per blob row, per manifest row and per
+upload-offset update, and on macOS it is `F_FULLFSYNC`, which genuinely waits for
+the hardware. cairn runs `synchronous=NORMAL`, which is the standard setting for
+WAL mode and was worth 39% of write throughput on its own.
+
+What that gives up is narrower than "less durable" suggests. In WAL mode NORMAL
+still survives a process crash, because the WAL is an ordinary file and the
+operating system holds the bytes — killing `cairnd` loses nothing. Power loss or a
+kernel panic can cost the last few committed transactions, whose bytes may still
+be in the page cache.
+
+What it cannot do is corrupt the database. WAL frames are checksummed and recovery
+stops at the first torn one, so the failure mode is losing the tail of recent
+history rather than an unreadable file. For a registry that means a client
+re-pushing content it still has, which is the cheapest kind of loss available —
+and the reason the default is worth trading away here but would not be in a
+system whose writes cannot be reconstructed by their author.
+
+**A contended write is a 503, not a 500.** `SQLITE_BUSY` is the store saying someone
+else held the lock. Nothing was wrong with the request and sending it again is the
+entire remedy, so reporting it as an internal fault is wrong twice: it claims the
+registry broke when it did not, and `UNSUPPORTED` tells the client that retrying is
+pointless. `oras` and containerd both honour `503` with `Retry-After`, which makes
+this the difference between a push that recovers by itself and one that fails in
+front of someone.
+
+The classification masks SQLite's result code to its low byte, because the extended
+codes — `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT` — do not compare equal to
+`SQLITE_BUSY`, and missing one reproduces the exact bug this fixes. Being *too* eager
+is the worse direction, though: 503 is an instruction to try again, so a permanent
+failure wearing it becomes a client retrying forever. Both directions have a test.
+
+The detail still goes only to the log. The wrapped error carries SQL text, and the
+result code is what lets an operator tell real contention from anything else that
+might answer with this status.
+
 **Content-Type must agree with the document's `mediaType`.** Both describe the
 same bytes, and which one a proxy or cache downstream believes is not knowable
 from here, so a disagreement is refused instead of silently resolved in favour of

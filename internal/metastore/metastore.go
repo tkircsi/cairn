@@ -23,6 +23,19 @@ import (
 // ErrNotFound is returned when a row is absent.
 var ErrNotFound = errors.New("not found")
 
+// ErrBusy is the store refusing a write because another writer holds the lock.
+//
+// It is separated from every other write failure because it is the only one that is
+// not a failure of the request. Nothing was wrong with what the caller asked for, and
+// asking again is very likely to work -- which makes it the one storage error a client
+// can act on, and the one that must not be reported as an internal fault.
+//
+// The distinction only pays off if it survives the trip out. An implementation MUST
+// wrap this rather than return it bare, so the driver's own message and result code
+// still reach the log; the caller decides what to do from errors.Is and the operator
+// diagnoses from the text.
+var ErrBusy = errors.New("store is busy")
+
 // Store indexes blob membership, manifests, tags, referrers and upload sessions.
 type Store interface {
 	// PutBlob records that a repository contains a blob. It is idempotent: the
