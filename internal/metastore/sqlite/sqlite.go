@@ -210,6 +210,33 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 
+	// One connection, and this is a throughput decision rather than a conservative one.
+	//
+	// SQLite has one write lock. An unbounded pool does not change that; it only decides
+	// how many goroutines contend for it, and contending is not free. The loser of the
+	// race waits inside SQLite's busy handler, which retries with backoff rather than
+	// queueing, so the wait is unfair -- and once its tail crosses busy_timeout, requests
+	// that were entirely valid start returning errors. At 32 concurrent writers that is
+	// a p99 of 1.5s and a failure on roughly half of runs.
+	//
+	// database/sql hands connections out FIFO, so capping the pool at one replaces that
+	// race with a fair queue. Measured at 32 writers over 10,000 objects, it cuts p99
+	// from 1.52s to 670ms and produced no SQLITE_BUSY in any run. Throughput is
+	// unchanged on its own -- the concurrency was never buying parallelism -- and rises
+	// once the WAL stops being fsynced per commit, which is the synchronous pragma.
+	//
+	// Two things follow, for whoever changes this next.
+	//
+	// Reads serialise onto this connection too, which throws away the concurrent readers
+	// WAL exists to provide. That is the reason to eventually queue writes at PutBlob and
+	// PutManifest and let reads go straight to a pool, rather than leaving the cap here.
+	//
+	// And with one connection, holding a transaction open while issuing a second query on
+	// s.db deadlocks: the transaction owns the only connection and the query waits for it
+	// forever. Nothing here does that today. DeleteManifest, the one transaction in this
+	// file, uses tx for every statement inside it.
+	db.SetMaxOpenConns(1)
+
 	store := &Store{db: db}
 
 	// Statistics are not a tuning nicety here; without them the referrers query gets

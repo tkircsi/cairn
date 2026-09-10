@@ -181,6 +181,22 @@ Each migration asks the schema whether it has already been applied rather than
 consulting a recorded version, because a version number can drift out of step with
 the database it claims to describe.
 
+**Every write goes through one connection, on purpose.** SQLite has a single write
+lock, so a pool of thirty-two connections does not write in parallel — it decides
+how many goroutines contend for that lock. Contending has a price: the loser waits
+inside SQLite's busy handler, which retries with backoff rather than queueing, so
+the wait is unfair and requests that were entirely valid start failing once its
+tail crosses `busy_timeout`. `database/sql` hands connections out FIFO, so capping
+the pool at one turns that race into a queue.
+
+It is a throughput decision, not a cautious one — the concurrency was never buying
+parallelism, only spending it on backoff. The cost is that reads serialise onto the
+same connection, which gives up the concurrent readers WAL exists to provide, and
+that is the reason to eventually queue writes at `PutBlob` and `PutManifest`
+instead of capping the pool. It also makes one bug possible that was not before:
+holding a transaction open while issuing another query on `s.db` now deadlocks,
+because the transaction owns the only connection.
+
 **Content-Type must agree with the document's `mediaType`.** Both describe the
 same bytes, and which one a proxy or cache downstream believes is not knowable
 from here, so a disagreement is refused instead of silently resolved in favour of

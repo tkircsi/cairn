@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -26,10 +27,25 @@ import (
 // benchmark all pass while the second connection has never been configured. It takes
 // two callers at once to open a second connection, and by then the symptom is a 500
 // rather than anything pointing here.
+//
+// The pool here is the test's own, not the store's, because the store's is capped at one
+// connection. The invariant is a property of the DSN -- whatever connection SQLite hands
+// back is already configured, however many there are -- so it has to be checked against a
+// pool that will open more than one. Asserting it through the store would quietly reduce
+// to a test of a single connection, which is the shape of the original bug.
 func TestPragmasHoldOnEveryConnection(t *testing.T) {
 	t.Parallel()
 
-	store := open(t)
+	db, err := sql.Open("sqlite", dsn(filepath.Join(t.TempDir(), "cairn.db")))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
 
 	// More than one connection, and held open together: asking the pool for two
 	// connections in sequence would hand back the same one twice and prove nothing.
@@ -55,7 +71,7 @@ func TestPragmasHoldOnEveryConnection(t *testing.T) {
 		go func() {
 			defer done.Done()
 
-			tx, err := store.db.BeginTx(context.Background(), nil)
+			tx, err := db.BeginTx(context.Background(), nil)
 			if err != nil {
 				t.Error(err)
 				ready.Done()
@@ -100,6 +116,27 @@ func TestPragmasHoldOnEveryConnection(t *testing.T) {
 			t.Errorf("connection %d has foreign_keys off: the schema's cascades are "+
 				"silently not enforced on it", i)
 		}
+	}
+}
+
+// TestStoreSerialisesWrites pins the pool at one connection.
+//
+// This looks like a test of a setter, and it is there because the value is load-bearing
+// and invisible. Removing the cap does not fail anything: every test still passes, the
+// conformance suite still passes, and the only symptom is that concurrent writers go back
+// to racing SQLite's busy handler and failing under sustained load -- which no test in
+// this repository reproduces, because it takes tens of writers and tens of thousands of
+// writes to show up.
+//
+// So the guarantee is asserted directly rather than through its consequences.
+func TestStoreSerialisesWrites(t *testing.T) {
+	t.Parallel()
+
+	store := open(t)
+
+	if got := store.db.Stats().MaxOpenConnections; got != 1 {
+		t.Errorf("MaxOpenConnections = %d, want 1: concurrent writers will contend for "+
+			"SQLite's single write lock through its busy handler rather than queue", got)
 	}
 }
 
