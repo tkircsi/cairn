@@ -1,0 +1,12 @@
+.git
+.github
+data
+**/data
+bench/results
+*.db
+*.db-*
+.idea
+.vscode
+*.swp
+*~
+.DS_Store
