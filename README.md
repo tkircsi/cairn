@@ -22,6 +22,22 @@ production traffic at. There are no tagged releases.
 go run ./cmd/cairnd -addr 127.0.0.1:5050 -root data
 ```
 
+### Docker
+
+No Go toolchain required. The image listens on all interfaces and stores state under `/data`:
+
+```sh
+docker build -t cairn .
+docker run --rm -p 5050:5050 -v cairn-data:/data cairn
+```
+
+In another terminal (no TLS, so `--plain-http`):
+
+```sh
+echo "hello from cairn" > note.txt
+oras push --plain-http 127.0.0.1:5050/acme/widgets:v1.0.0 note.txt:text/plain
+```
+
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `-addr` | `127.0.0.1:5050` | address to listen on |
