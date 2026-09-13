@@ -14,3 +14,19 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)"
       - run: go test ./...
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: OCI conformance
+        run: ./scripts/conformance.sh
+      - name: Upload conformance report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: conformance-report/
