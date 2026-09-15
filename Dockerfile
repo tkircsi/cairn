@@ -14,7 +14,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/cairnd 
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/cairnd /cairnd
-USER nonroot:nonroot
 EXPOSE 5050
 VOLUME ["/data"]
 ENTRYPOINT ["/cairnd"]
